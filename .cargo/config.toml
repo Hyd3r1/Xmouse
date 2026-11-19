@@ -1,0 +1,12 @@
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+# Single self-contained .exe: no libstdc++ / libgcc / winpthread DLLs needed.
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-args=-static -static-libgcc -static-libstdc++", "-L", "native=/usr/lib/gcc/x86_64-w64-mingw32/13-posix"]
+
+[target.x86_64-pc-windows-msvc]
+# Single self-contained .exe: no Visual C++ runtime install needed.
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[env]
+# Link the C++ runtime used by the H.264 decoder statically on Windows.
+CXXSTDLIB_x86_64_pc_windows_gnu = "static=stdc++"

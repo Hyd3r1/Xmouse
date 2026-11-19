@@ -1,0 +1,23 @@
+# Build output
+target/
+release/
+dist/
+*.exe
+*.pdb
+*.zip
+
+# Notes and docs (kept local), except the README
+*.md
+!README.md
+
+# Logs and local tools
+*.log
+.claude/
+graphify-out/
+.vscode/
+.idea/
+
+# OS junk
+Thumbs.db
+desktop.ini
+.DS_Store

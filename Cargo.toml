@@ -1,0 +1,55 @@
+[package]
+name = "xmouse"
+version = "1.0.0"
+edition = "2021"
+description = "Play your own Xbox with mouse and keyboard over your home network"
+license = "CC-BY-NC-SA-4.0"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "x11", "wayland", "persistence"] }
+egui = "0.37"
+egui_glow = "0.37"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+webrtc = "0.17"
+bytes = "1"
+uuid = { version = "1", features = ["v4"] }
+directories = "6"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+openh264 = "0.9"
+rfd = "0.18"
+url = "2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+opus = "0.3"
+cpal = "0.18.2"
+
+[target.'cfg(windows)'.dependencies]
+# timeBeginPeriod(1): 1 ms timer resolution for the input loop (Windows defaults to ~15.6 ms).
+windows-sys = { version = "0.61", features = ["Win32_Media"] }
+# RTX Video Super Resolution: D3D11 video processor + WGL_NV_DX_interop (src/vsr.rs).
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_OpenGL",
+] }
+glow = "0.17"
+
+[dev-dependencies]
+# examples/relay.rs (diagnostic HTTP relay)
+tokio = { version = "1", features = ["net", "io-util"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+
+[profile.dev.package."*"]
+opt-level = 2

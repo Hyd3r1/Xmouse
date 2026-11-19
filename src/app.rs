@@ -1692,12 +1692,12 @@ impl XMouseApp {
         }
     }
 
-    /// "Which console do you play?": Xbox, or the console of an installed plugin.
+    /// "Which console do you play on?": Xbox, or the console of an installed plugin.
     fn platform_page(&mut self, ui: &mut Ui) {
         ui.add_space((ui.available_height() * 0.18).max(20.0));
         ui.vertical_centered(|ui| {
             ui.label(
-                RichText::new("Which console do you play?")
+                RichText::new("Which console do you play on?")
                     .font(display(34.0))
                     .color(INK),
             );

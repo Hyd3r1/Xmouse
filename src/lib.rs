@@ -6,6 +6,7 @@ pub mod chime;
 pub mod mapper;
 pub mod packet;
 pub mod profile;
+pub mod ps;
 pub mod storage;
 pub mod stream;
 pub mod video;

@@ -184,8 +184,7 @@ pub fn pad_view(ui: &mut Ui, f: &PadFrame, width: f32) {
     let drawing = Rect::from_min_size(origin, vec2(dw * s, dh * s));
     painter.image(tex.lines.id(), drawing, full_uv, INK);
 
-    // Sticks: a fixed ring and a cap that moves with the stick, tinting as it tilts and lit
-    // when the stick is clicked in.
+    // Sticks: a fixed ring and a cap that moves with the stick.
     for ((cx, cy), x, y, click) in [
         (LEFT_STICK, f.lx, f.ly, Action::LeftThumb),
         (RIGHT_STICK, f.rx, f.ry, Action::RightThumb),
@@ -193,11 +192,8 @@ pub fn pad_view(ui: &mut Ui, f: &PadFrame, width: f32) {
         painter.circle_stroke(at(cx, cy), WELL_R * s, Stroke::new(3.4 * s, INK));
         let (x, y) = (x.clamp(-1.0, 1.0), y.clamp(-1.0, 1.0));
         let cap = at(cx + x * STICK_TRAVEL, cy + y * STICK_TRAVEL);
-        let fill = if f.pressed(click) {
-            SIGNAL
-        } else {
-            blend(KEY, SIGNAL, (x.hypot(y) * 0.45).min(0.45))
-        };
+        // Looks like the drawing (white cap) and just moves; lit only when clicked in.
+        let fill = if f.pressed(click) { SIGNAL } else { KEY };
         painter.circle_filled(cap, CAP_R * s, fill);
         painter.circle_stroke(cap, CAP_R * s, Stroke::new(4.2 * s, INK));
         painter.circle_stroke(cap, CAP_INNER_R * s, Stroke::new(2.6 * s, INK));
@@ -218,12 +214,6 @@ pub fn pad_view(ui: &mut Ui, f: &PadFrame, width: f32) {
         }
         painter.text(bar.center(), Align2::CENTER_CENTER, label, bold(15.0 * s), INK);
     }
-}
-
-/// `a` moved `t` (0–1) of the way to `b`.
-fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
-    let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
-    Color32::from_rgb(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()))
 }
 
 #[cfg(test)]

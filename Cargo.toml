@@ -1,6 +1,6 @@
 [package]
 name = "xmouse"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "Play your own Xbox with mouse and keyboard over your home network"
 license = "CC-BY-NC-SA-4.0"

@@ -1840,8 +1840,10 @@ impl XMouseApp {
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
                     ui.set_width(kb_w);
+                    // White (bound) only when the key really does something in this layer, the
+                    // same way the mapper resolves it; a key set to "Nothing" shows as unused.
                     let look = |d: &crate::keyboard::KeyDef| match find(d.code) {
-                        Some((b, inherited)) => crate::keyboard::KeyLook {
+                        Some((b, inherited)) if b.does_something() => crate::keyboard::KeyLook {
                             bound: true,
                             action: if inherited {
                                 format!("{} ·", b.title())
@@ -1850,7 +1852,7 @@ impl XMouseApp {
                             },
                             pad: chip_text(b.action),
                         },
-                        None => crate::keyboard::KeyLook {
+                        _ => crate::keyboard::KeyLook {
                             bound: false,
                             action: String::new(),
                             pad: String::new(),
@@ -1894,8 +1896,12 @@ impl XMouseApp {
                                 true,
                             );
                             match &found {
-                                Some((b, _)) => {
+                                Some((b, _)) if b.does_something() => {
                                     ui.label(RichText::new(b.title()).font(bold(15.0)).color(INK))
+                                }
+                                // Set to "Nothing" in this layer (e.g. "Unused in vehicles").
+                                Some((b, _)) => {
+                                    ui.label(RichText::new(b.title()).font(body(15.0)).color(MUTED))
                                 }
                                 None => {
                                     ui.label(RichText::new("free").font(body(15.0)).color(MUTED))
@@ -1912,7 +1918,7 @@ impl XMouseApp {
                     let (mut left, mut right) = (0, 0);
                     for d in &defs {
                         if d.usable == crate::keyboard::Usable::Yes
-                            && layer.bindings.iter().any(|b| b.input == d.code)
+                            && find(d.code).is_some_and(|(b, _)| b.does_something())
                         {
                             if d.x < 7.0 {
                                 left += 1
@@ -1921,10 +1927,9 @@ impl XMouseApp {
                             }
                         }
                     }
-                    let mouse = layer
-                        .bindings
+                    let mouse = ["Mouse0", "Mouse1", "Mouse2", "Mouse3", "Mouse4", "WheelUp", "WheelDown"]
                         .iter()
-                        .filter(|b| b.input.starts_with("Mouse") || b.input.starts_with("Wheel"))
+                        .filter(|c| find(c).is_some_and(|(b, _)| b.does_something()))
                         .count();
                     ui.add_space(4.0);
                     ui.label(

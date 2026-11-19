@@ -759,6 +759,48 @@ mod tests {
         assert!(suggest_sensitivity(&[1.0, 2.0]).is_none());
     }
 
+    /// The key editor shows a key as bound exactly when pressing it does something: in every
+    /// built-in profile and layer, compare its rule with what the mapper really does.
+    #[test]
+    fn key_editor_bound_keys_match_what_the_mapper_does() {
+        for p in builtin_profiles() {
+            let inputs: HashSet<String> = p
+                .layers
+                .iter()
+                .flat_map(|l| l.bindings.iter().map(|b| b.input.clone()))
+                .collect();
+            for li in 0..p.layers.len() {
+                for input in &inputs {
+                    // The key editor's rule: this layer's binding, else the base layer's.
+                    let shown = p.layers[li]
+                        .bindings
+                        .iter()
+                        .find(|b| &b.input == input)
+                        .or_else(|| {
+                            (li > 0)
+                                .then(|| p.layers[0].bindings.iter().find(|b| &b.input == input))
+                                .flatten()
+                        })
+                        .is_some_and(|b| b.does_something());
+                    // What the mapper does when the key is pressed in that layer.
+                    let mut m = Mapper::new(p.clone());
+                    m.layer = li;
+                    if input.starts_with("Wheel") {
+                        m.wheel(input == "WheelUp", 0.0);
+                    } else {
+                        m.press(input, 0.0);
+                    }
+                    let acts = !m.active_actions(1.0).is_empty() || m.layer != li;
+                    assert_eq!(
+                        shown, acts,
+                        "{} / {}: key {input} shown as bound = {shown}, does something = {acts}",
+                        p.name, p.layers[li].name
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn builtins_are_valid() {
         let special = [

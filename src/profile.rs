@@ -191,6 +191,12 @@ pub struct Binding {
 }
 
 impl Binding {
+    /// Whether pressing the key does anything: presses a controller button or switches layer.
+    /// A key bound to "Nothing" in a layer only stops the base layer's binding from applying.
+    pub fn does_something(&self) -> bool {
+        self.action != Action::None || self.switch_layer.is_some()
+    }
+
     /// Give the binding an in-game name.
     pub fn named(mut self, label: &str) -> Self {
         self.label = label.to_string();

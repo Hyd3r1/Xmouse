@@ -174,7 +174,6 @@ fn parse(b: &[u8]) -> Asset {
     }
 }
 
-#[derive(Clone)]
 struct Textures {
     size: [usize; 2],
     lines: egui::TextureHandle,
@@ -182,9 +181,11 @@ struct Textures {
 }
 
 /// White, alpha-only textures (tinted when drawn), uploaded once per egui context and layout.
-fn textures(ctx: &egui::Context, layout: &Layout) -> Textures {
+/// Shared behind an `Arc`: the drawing is on screen every frame of a session, and copying
+/// sixteen texture handles (each a trip through the texture manager's lock) per frame is waste.
+fn textures(ctx: &egui::Context, layout: &Layout) -> std::sync::Arc<Textures> {
     let id = egui::Id::unique(("xmouse-controller-textures", layout.name));
-    if let Some(t) = ctx.data(|d| d.get_temp::<Textures>(id)) {
+    if let Some(t) = ctx.data(|d| d.get_temp::<std::sync::Arc<Textures>>(id)) {
         return t;
     }
     let asset = parse(layout.asset);
@@ -225,11 +226,11 @@ fn textures(ctx: &egui::Context, layout: &Layout) -> Textures {
             )
         })
         .collect();
-    let t = Textures {
+    let t = std::sync::Arc::new(Textures {
         size: asset.size,
         lines,
         parts,
-    };
+    });
     ctx.data_mut(|d| d.insert_temp(id, t.clone()));
     t
 }

@@ -19,8 +19,6 @@ fn main() -> eframe::Result {
     }
     let args: Vec<String> = std::env::args().collect();
     let opts = Options {
-        autostart: args.iter().any(|a| a == "--autostart"),
-        kiosk: args.iter().any(|a| a == "--kiosk"),
         play: args.iter().any(|a| a == "--play"),
     };
 

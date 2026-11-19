@@ -2,7 +2,7 @@
 
 use egui::{pos2, vec2, Align2, Color32, CornerRadius, Rect, Sense, Shape, Stroke, StrokeKind, Ui};
 
-use crate::theme::{bold, mono, EDGE, IDLE, INK, KEY, LABEL, MUTED, PAGE, SIGNAL};
+use crate::theme::{bold, mono, motion, EDGE, IDLE, INK, KEY, LABEL, MUTED, PAGE, SIGNAL};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Usable {
@@ -52,8 +52,13 @@ fn row(out: &mut Vec<KeyDef>, row: usize, start: f32, keys: &[(&'static str, &'s
     }
 }
 
-/// US QWERTY layout with a navigation column on the right.
-pub fn layout() -> Vec<KeyDef> {
+/// US QWERTY layout with a navigation column on the right (built once).
+pub fn layout() -> &'static [KeyDef] {
+    static LAYOUT: std::sync::OnceLock<Vec<KeyDef>> = std::sync::OnceLock::new();
+    LAYOUT.get_or_init(build_layout)
+}
+
+fn build_layout() -> Vec<KeyDef> {
     let mut k = Vec::new();
     row(
         &mut k,
@@ -268,8 +273,23 @@ pub fn draw(
             }
         };
         let is_sel = selected == Some(d.code) && d.usable == Usable::Yes && !d.code.is_empty();
-        let pressed = resp.is_pointer_button_down_on();
-        let top = r.translate(vec2(0.0, if pressed { 2.0 } else { 0.0 }));
+        // Keys you can bind sink under the pointer and brighten on hover, eased like every
+        // other key-shaped button; the rest don't react.
+        let (hover, press) = if d.usable == Usable::Yes {
+            let down = resp.is_pointer_button_down_on();
+            (
+                motion::flag(ui.ctx(), id.with("hover"), resp.hovered() || down, motion::FAST),
+                motion::flag(ui.ctx(), id.with("press"), down, motion::FAST),
+            )
+        } else {
+            (0.0, 0.0)
+        };
+        let sel_t = if d.usable == Usable::Yes {
+            motion::flag(ui.ctx(), id.with("selected"), is_sel, motion::FAST)
+        } else {
+            0.0
+        };
+        let top = r.translate(vec2(0.0, 2.0 * press));
         let p = ui.painter();
 
         let (fill, edge, text_col, outline) = match (d.usable, lk.bound) {
@@ -277,7 +297,7 @@ pub fn draw(
             (Usable::No, _) => (PAGE, PAGE, MUTED, Stroke::NONE),
             (Usable::Yes, true) => (KEY, EDGE, INK, Stroke::new(1.5, INK)),
             (Usable::Yes, false) => (
-                if resp.hovered() { KEY } else { IDLE },
+                crate::theme::mix(IDLE, KEY, hover),
                 EDGE,
                 LABEL,
                 Stroke::new(1.0, EDGE),
@@ -290,11 +310,11 @@ pub fn draw(
             p.rect_filled(r.translate(vec2(0.0, 3.0)), corner, edge);
             p.rect(top, corner, fill, outline, StrokeKind::Inside);
         }
-        if is_sel {
+        if sel_t > 0.0 {
             p.rect_stroke(
                 top.expand(1.0),
                 corner,
-                Stroke::new(3.0, SIGNAL),
+                Stroke::new(3.0 * sel_t, SIGNAL.gamma_multiply(sel_t)),
                 StrokeKind::Outside,
             );
         }

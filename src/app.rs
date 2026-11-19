@@ -24,7 +24,7 @@ const KEY_FINDER: egui::Key = egui::Key::F6;
 const KEY_HUD: egui::Key = egui::Key::F7;
 const KEY_FULLSCREEN: egui::Key = egui::Key::F11;
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Page {
     Home,
     More,
@@ -36,6 +36,120 @@ enum Page {
     Test,
     Picture,
     Setup,
+}
+
+impl Page {
+    /// How deep in the app a page is: Play, the pages one step from it, the pages under More.
+    fn depth(self) -> i32 {
+        match self {
+            Page::Home => 0,
+            Page::More | Page::Consoles => 1,
+            Page::Test => 3,
+            _ => 2,
+        }
+    }
+}
+
+/// What the window is showing. A change of view is what the page transition animates.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum View {
+    Platform,
+    Account,
+    SignIn,
+    Page(Page),
+    /// A session: 0 connecting, 1 ready or paused, 2 in control.
+    Session(u8),
+}
+
+/// Which way the new view comes in: sideways for going deeper (+1) or back (-1), a small
+/// rise (0) for everything else.
+fn transition_direction(from: View, to: View) -> f32 {
+    match (from, to) {
+        (View::Page(a), View::Page(b)) => (b.depth() - a.depth()).signum() as f32,
+        _ => 0.0,
+    }
+}
+
+/// Page changes: remembers the view and the back button's label, and when each last changed.
+struct Nav {
+    view: Option<View>,
+    since: f64,
+    dir: f32,
+    /// The view changed this frame: its scroll area starts at the top.
+    fresh: bool,
+    back: Option<&'static str>,
+    back_since: f64,
+}
+
+impl Nav {
+    fn new() -> Self {
+        Self {
+            view: None,
+            since: f64::NEG_INFINITY,
+            dir: 0.0,
+            fresh: false,
+            back: None,
+            back_since: f64::NEG_INFINITY,
+        }
+    }
+
+    /// Say what this frame shows. Returns (how far the view has come in, 0..=1; direction).
+    fn show(&mut self, ctx: &egui::Context, view: View) -> (f32, f32) {
+        let now = ctx.input(|i| i.time);
+        match self.view {
+            Some(v) if v == view => {}
+            // The first view of a run just appears.
+            None => self.view = Some(view),
+            Some(old) => {
+                self.dir = transition_direction(old, view);
+                self.view = Some(view);
+                self.since = now;
+                self.fresh = true;
+            }
+        }
+        (Self::progress(ctx, now, self.since), self.dir)
+    }
+
+    /// How far the back button has faded in since it appeared or its label changed.
+    fn back_fade(&mut self, ctx: &egui::Context, back: Option<&'static str>) -> f32 {
+        let now = ctx.input(|i| i.time);
+        if back != self.back {
+            // Only a button that is there fades in; a view without one has nothing to show.
+            if back.is_some() && self.view.is_some() && self.since > f64::NEG_INFINITY {
+                self.back_since = now;
+            }
+            self.back = back;
+        }
+        Self::progress(ctx, now, self.back_since)
+    }
+
+    fn progress(ctx: &egui::Context, now: f64, since: f64) -> f32 {
+        let t = ((now - since) / motion::SLOW as f64).clamp(0.0, 1.0) as f32;
+        if t < 1.0 {
+            ctx.request_repaint_after(motion::FRAME);
+        }
+        motion::ease_out(t)
+    }
+}
+
+/// Lay out a view's content while it comes in: faded and a few points off its place.
+/// Always goes through the same child `Ui`, so widget ids don't change when it has arrived.
+fn entering<R>(ui: &mut Ui, (t, dir): (f32, f32), add: impl FnOnce(&mut Ui) -> R) -> R {
+    let off = (1.0 - t)
+        * if dir == 0.0 {
+            vec2(0.0, 10.0)
+        } else {
+            vec2(18.0 * dir, 0.0)
+        };
+    let rect = ui.available_rect_before_wrap().translate(off);
+    ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+        if t < 1.0 {
+            // The fade finishes a little before the slide does.
+            ui.set_opacity((t * 1.4).min(1.0));
+        }
+        add(ui)
+    })
+    .inner
 }
 
 /// Results of background work, written by async tasks and read by the UI.
@@ -103,6 +217,8 @@ struct Session {
     mods: egui::Modifiers,
     /// When the picture first appeared (the "game ignoring your keys?" tip shows for a while).
     tip_since: Option<Instant>,
+    /// The overlay's key list for a layer: (layer it was built for, its rows).
+    legend: (Option<String>, Arc<Vec<(String, String)>>),
 }
 
 struct TestPad {
@@ -141,7 +257,6 @@ pub struct XMouseApp {
     session: Option<Session>,
     editor: Editor,
     toasts: Vec<(String, bool, Instant)>,
-    autostart: bool,
     /// --play: start the last console in the last mode as soon as consoles are known.
     play_on_start: bool,
     /// Installed console plugins (other platforms), found at startup.
@@ -150,6 +265,10 @@ pub struct XMouseApp {
     pairing: Option<Pairing>,
     ctx: egui::Context,
     frame_no: u64,
+    /// Page transitions.
+    nav: Nav,
+    /// When the last frame started (outside a session, frames are paced; see `ui`).
+    frame_start: Instant,
     /// Fake consoles for screenshots / UI testing (XMOUSE_DEMO=1).
     demo: bool,
     came_from_keys: bool,
@@ -167,8 +286,6 @@ pub struct XMouseApp {
 }
 
 pub struct Options {
-    pub autostart: bool,
-    pub kiosk: bool,
     /// Start playing right away (last console, last mode), e.g. from a desktop shortcut.
     pub play: bool,
 }
@@ -186,10 +303,6 @@ impl XMouseApp {
             .expect("tokio runtime");
         let demo = std::env::var_os("XMOUSE_DEMO").is_some();
         let signed_in = demo || rt.block_on(auth.is_signed_in());
-        if opts.kiosk {
-            cc.egui_ctx
-                .send_viewport_cmd(ViewportCommand::Fullscreen(true));
-        }
         let profiles = storage.profiles();
         let mut settings = storage.settings();
         // The graphics driver crashed while RTX Video was upscaling last time: switch it off
@@ -249,12 +362,13 @@ impl XMouseApp {
                 ..Default::default()
             },
             toasts: startup_toasts,
-            autostart: opts.autostart,
             play_on_start: opts.play,
             plugins,
             pairing: None,
             ctx: cc.egui_ctx.clone(),
             frame_no: 0,
+            nav: Nav::new(),
+            frame_start: Instant::now(),
             demo,
             came_from_keys: false,
             #[cfg(windows)]
@@ -360,7 +474,15 @@ impl XMouseApp {
             return;
         }
         let (plugins, bg, ctx) = (self.plugins.clone(), self.bg.clone(), self.ctx.clone());
-        bg.lock().unwrap().plugins_loading = true;
+        {
+            // One lookup at a time: "Look for consoles again" clicked twice must not start
+            // the plugin twice.
+            let mut b = bg.lock().unwrap();
+            if b.plugins_loading {
+                return;
+            }
+            b.plugins_loading = true;
+        }
         self.rt.spawn_blocking(move || {
             let mut list = Vec::new();
             let mut needs_pairing = std::collections::HashSet::new();
@@ -458,24 +580,31 @@ impl XMouseApp {
                     "Enter the PIN the console shows for remote play pairing. This is needed once.",
                 );
                 ui.add_space(6.0);
-                let edit = ui.add_enabled(
-                    !p.busy,
-                    egui::TextEdit::singleline(&mut p.pin)
-                        .char_limit(16)
-                        .hint_text("PIN")
-                        .desired_width(200.0),
-                );
+                let busy = p.busy;
+                let edit = ui
+                    .add_enabled_ui(!busy, |ui| {
+                        text_field(
+                            ui,
+                            egui::TextEdit::singleline(&mut p.pin)
+                                .char_limit(16)
+                                .hint_text("PIN")
+                                .desired_width(200.0),
+                        )
+                    })
+                    .inner;
                 if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     pair = true;
                 }
                 if let Some(e) = &p.error {
-                    ui.label(RichText::new(e).font(body(14.0)).color(SIGNAL_TEXT));
+                    error_text(ui, e);
                 }
-                ui.add_space(8.0);
+                ui.add_space(space::S);
                 ui.horizontal(|ui| {
                     if p.busy {
-                        ui.spinner();
-                        ui.label(RichText::new("Pairing…").font(body(14.0)).color(MUTED));
+                        // As tall as the buttons it replaces, so the window doesn't jump.
+                        ui.set_min_height(53.0);
+                        spinner(ui);
+                        hint(ui, "Pairing…");
                     } else {
                         if primary(ui, "Pair", 120.0).clicked() {
                             pair = true;
@@ -751,6 +880,7 @@ impl XMouseApp {
             vsr_target: [0, 0],
             video_size: [0, 0],
             tip_since: None,
+            legend: (None, Arc::new(Vec::new())),
             mods: egui::Modifiers::default(),
         });
     }
@@ -905,6 +1035,25 @@ fn mouse_name(b: egui::PointerButton) -> &'static str {
     }
 }
 
+/// How long a toast stays: long enough to read it (5 s for a short one, up to 12 s).
+fn toast_secs(msg: &str) -> f32 {
+    (3.5 + msg.chars().count() as f32 * 0.05).clamp(5.0, 12.0)
+}
+
+/// How far a toast has come in and how much of it is left (both 0..=1), from its age and
+/// the time it has left.
+fn toast_phase(age: f32, left: f32) -> (f32, f32) {
+    (
+        motion::ease_out(age / motion::SLOW),
+        motion::ease_out(left / motion::SLOW),
+    )
+}
+
+/// How many `item`-wide things fit side by side in `avail` with `gap` between them (at least 1).
+fn per_line(avail: f32, item: f32, gap: f32) -> usize {
+    (((avail + gap) / (item + gap)).floor() as usize).max(1)
+}
+
 fn page_frame() -> egui::Frame {
     egui::Frame::new().fill(PAGE).inner_margin(Margin {
         left: 24,
@@ -929,6 +1078,18 @@ impl eframe::App for XMouseApp {
     }
 
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
+        // Outside a session nothing needs more than ~144 frames a second. Vsync is off (for
+        // the lowest input delay while playing), so without this a moving mouse, an open
+        // menu or the Test page would redraw thousands of times a second and keep a CPU
+        // core busy. A session is never paced: there every frame carries input.
+        if self.session.is_none() {
+            const MIN_FRAME: Duration = Duration::from_micros(6900);
+            let since = self.frame_start.elapsed();
+            if since < MIN_FRAME {
+                std::thread::sleep(MIN_FRAME - since);
+            }
+        }
+        self.frame_start = Instant::now();
         self.frame_no += 1;
         let ctx = ui.ctx().clone();
         let new_toasts: Vec<(String, bool)> = std::mem::take(&mut self.bg.lock().unwrap().toasts);
@@ -947,31 +1108,24 @@ impl eframe::App for XMouseApp {
             self.session_ui(ui, &ctx, frame);
         } else if self.choosing_platform() || needs_account {
             // First the console type, then (PlayStation) the account ID pairing needs.
-            top_bar(ui, None, None);
+            let view = if needs_account { View::Account } else { View::Platform };
+            let enter = self.nav.show(&ctx, view);
+            self.nav.back_fade(&ctx, None);
+            top_bar(ui, None, None, 1.0);
             status_bar(ui, if needs_account { "PlayStation" } else { "Pick your console" });
-            egui::CentralPanel::default()
-                .frame(page_frame())
-                .show(ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            if needs_account {
-                                self.plugin_account_page(ui)
-                            } else {
-                                self.platform_page(ui)
-                            }
-                        });
-                });
+            self.page_body(ui, view, enter, |app, ui| {
+                if needs_account {
+                    app.plugin_account_page(ui)
+                } else {
+                    app.platform_page(ui)
+                }
+            });
         } else if platform.is_none() && !signed_in {
-            top_bar(ui, None, None);
+            let enter = self.nav.show(&ctx, View::SignIn);
+            self.nav.back_fade(&ctx, None);
+            top_bar(ui, None, None, 1.0);
             status_bar(ui, "Not signed in");
-            egui::CentralPanel::default()
-                .frame(page_frame())
-                .show(ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| self.sign_in_page(ui));
-                });
+            self.page_body(ui, View::SignIn, enter, |app, ui| app.sign_in_page(ui));
         } else {
             let back = match self.page {
                 Page::Home => None,
@@ -979,10 +1133,15 @@ impl eframe::App for XMouseApp {
                 Page::Test if self.came_from_keys => Some("Keys"),
                 _ => Some("More"),
             };
-            if top_bar(ui, back, None) {
+            self.nav.show(&ctx, View::Page(self.page));
+            let back_fade = self.nav.back_fade(&ctx, back);
+            if top_bar(ui, back, None, back_fade) {
                 if self.page == Page::Test {
                     self.stop_test();
                 }
+                // Leaving the Keys page ends a key pick that was still waiting; it would
+                // otherwise take the first key pressed after coming back.
+                self.editor.listening = None;
                 self.flush_profile();
                 self.page = match self.page {
                     Page::More | Page::Consoles => Page::Home,
@@ -993,27 +1152,49 @@ impl eframe::App for XMouseApp {
             }
             let status = self.status_line();
             status_bar(ui, &status);
-            egui::CentralPanel::default()
-                .frame(page_frame())
-                .show(ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| match self.page {
-                            Page::Home => self.home_page(ui),
-                            Page::More => self.more_page(ui),
-                            Page::Consoles => self.consoles_page(ui),
-                            Page::PressOnce => self.press_once_page(ui),
-                            Page::Profiles => self.profiles_page(ui),
-                            Page::Keys => self.keys_page(ui, &ctx),
-                            Page::Mouse => self.mouse_page(ui),
-                            Page::Test => self.test_page(ui, &ctx),
-                            Page::Picture => self.picture_page(ui),
-                            Page::Setup => self.setup_page(ui),
-                        });
-                });
+            // (Again: a click on the back button just changed the page.)
+            let view = View::Page(self.page);
+            let enter = self.nav.show(&ctx, view);
+            self.page_body(ui, view, enter, |app, ui| match app.page {
+                Page::Home => app.home_page(ui),
+                Page::More => app.more_page(ui),
+                Page::Consoles => app.consoles_page(ui),
+                Page::PressOnce => app.press_once_page(ui),
+                Page::Profiles => app.profiles_page(ui),
+                Page::Keys => app.keys_page(ui, &ctx),
+                Page::Mouse => app.mouse_page(ui),
+                Page::Test => app.test_page(ui, &ctx),
+                Page::Picture => app.picture_page(ui),
+                Page::Setup => app.setup_page(ui),
+            });
         }
         self.toasts_ui(&ctx);
         self.autosave();
+    }
+}
+
+impl XMouseApp {
+    /// The scrolling body of a page. Every view keeps its own scroll position, starts at
+    /// the top when you arrive, and comes in with the page transition.
+    fn page_body(
+        &mut self,
+        ui: &mut Ui,
+        view: View,
+        enter: (f32, f32),
+        add: impl FnOnce(&mut Self, &mut Ui),
+    ) {
+        let fresh = std::mem::take(&mut self.nav.fresh);
+        egui::CentralPanel::default()
+            .frame(page_frame())
+            .show(ui, |ui| {
+                let mut area = egui::ScrollArea::vertical()
+                    .id_salt(("page", view))
+                    .auto_shrink([false, false]);
+                if fresh {
+                    area = area.vertical_scroll_offset(0.0);
+                }
+                area.show(ui, |ui| entering(ui, enter, |ui| add(self, ui)));
+            });
     }
 }
 
@@ -1034,29 +1215,71 @@ impl XMouseApp {
 
     // ------------------------------------------------------------------ toasts / autosave
 
+    /// Toasts stack up from the bottom right. Each one slides up and fades in, stays long
+    /// enough to read, then fades out while the ones above settle down into its place.
+    /// They are only painted: clicks go through to whatever is underneath.
     fn toasts_ui(&mut self, ctx: &egui::Context) {
         self.toasts
-            .retain(|t| t.2.elapsed() < Duration::from_secs(5));
+            .retain(|t| t.2.elapsed().as_secs_f32() < toast_secs(&t.0));
         if self.toasts.is_empty() {
             return;
         }
-        egui::Area::new(egui::Id::unique("toasts"))
-            .anchor(egui::Align2::RIGHT_BOTTOM, vec2(-18.0, -42.0))
-            .show(ctx, |ui| {
-                for (msg, err, _) in &self.toasts {
-                    egui::Frame::new()
-                        .fill(KEY)
-                        .stroke(Stroke::new(1.5, if *err { SIGNAL } else { EDGE }))
-                        .corner_radius(CornerRadius::same(14))
-                        .inner_margin(Margin::symmetric(16, 12))
-                        .show(ui, |ui| {
-                            ui.set_max_width(380.0);
-                            ui.label(RichText::new(msg).font(medium(14.5)).color(INK));
-                        });
-                    ui.add_space(4.0);
-                }
+        let screen = ctx.content_rect();
+        let mut painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::unique("toasts"),
+        ));
+        let (pad, gap) = (vec2(16.0, 12.0), 6.0);
+        let text_w = (screen.width() - 2.0 * 18.0 - 2.0 * pad.x).clamp(80.0, 380.0);
+        let mut bottom = screen.bottom() - 42.0;
+        // When the next frame is needed: now while something moves, else when the next
+        // toast starts to leave.
+        let mut wake = f32::INFINITY;
+        for (msg, err, born) in self.toasts.iter().rev() {
+            let age = born.elapsed().as_secs_f32();
+            let left = toast_secs(msg) - age;
+            let (t_in, t_out) = toast_phase(age, left);
+            wake = wake.min(if t_in < 1.0 || t_out < 1.0 {
+                0.0
+            } else {
+                left - motion::SLOW
             });
-        ctx.request_repaint_after(Duration::from_millis(500));
+            let shown = t_in * t_out;
+            let galley = painter.layout(msg.clone(), medium(14.5), INK, text_w);
+            let size = galley.size() + 2.0 * pad;
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(
+                    screen.right() - 18.0 - size.x,
+                    bottom - size.y + 12.0 * (1.0 - t_in),
+                ),
+                size,
+            );
+            painter.set_opacity(shown);
+            painter.add(
+                egui::Shadow {
+                    offset: [0, 3],
+                    blur: 12,
+                    spread: 0,
+                    color: Color32::from_black_alpha(22),
+                }
+                .as_shape(rect, CornerRadius::same(radius::BUTTON)),
+            );
+            painter.rect(
+                rect,
+                CornerRadius::same(radius::BUTTON),
+                KEY,
+                Stroke::new(1.5, if *err { SIGNAL } else { EDGE }),
+                egui::StrokeKind::Inside,
+            );
+            painter.galley(rect.min + pad, galley, INK);
+            // An arriving toast makes room gradually, a leaving one gives it back the same way.
+            bottom -= (size.y + gap) * shown;
+        }
+        if wake <= 0.0 {
+            ctx.request_repaint_after(motion::FRAME);
+        } else {
+            ctx.request_repaint_after(Duration::from_secs_f32(wake.min(60.0)));
+        }
     }
 
     fn mark_dirty(&mut self) {
@@ -1195,13 +1418,13 @@ impl XMouseApp {
                         });
                 });
                 centered_row(ui, 220.0, |ui| {
-                    ui.spinner();
+                    spinner(ui);
                     hint(ui, "Waiting for you to sign in…");
                 });
             } else {
-                ui.add_space(4.0);
+                ui.add_space(space::XS);
                 centered_row(ui, 300.0, |ui| {
-                    start = primary(
+                    start = busy_button(
                         ui,
                         if busy {
                             "Contacting Microsoft…"
@@ -1209,17 +1432,18 @@ impl XMouseApp {
                             "Sign in with Microsoft"
                         },
                         300.0,
+                        SIGNAL,
+                        SIGNAL_EDGE,
+                        busy,
                     )
                     .clicked()
                         && !busy;
                 });
                 if let Some(e) = &err {
-                    ui.add_space(6.0);
-                    ui.vertical_centered(|ui| {
-                        ui.label(RichText::new(e).font(medium(14.5)).color(SIGNAL_TEXT))
-                    });
+                    ui.add_space(space::S);
+                    ui.vertical_centered(|ui| error_text(ui, e));
                 }
-                ui.add_space(14.0);
+                ui.add_space(space::L);
             }
             section(ui, "Before you start");
             setup_group(ui);
@@ -1255,23 +1479,6 @@ impl XMouseApp {
             .find(|c| c.server_id == self.settings.last_console)
             .or(list.first())
             .cloned();
-        if self.autostart {
-            if consoles.is_some() {
-                self.autostart = false;
-                if let Some(c) = list
-                    .iter()
-                    .find(|c| c.server_id == self.settings.last_console)
-                {
-                    // Autostart is the TV setup: play TV Play without overwriting the play mode
-                    // you picked for normal starts.
-                    let saved = self.settings.last_mode;
-                    self.start_session(c.clone(), PlayMode::Tv);
-                    self.settings.last_mode = saved;
-                    self.save_settings();
-                    return;
-                }
-            }
-        }
         // --play: one-click start (e.g. a desktop shortcut) on the last console, last mode.
         // A plugin console may only show up once the plugins have answered: wait for them
         // before giving up.
@@ -1307,24 +1514,31 @@ impl XMouseApp {
             // Console line
             match (&consoles, &selected) {
                 (None, _) => {
-                    ui.horizontal(|ui| {
-                        let w = 240.0;
-                        ui.add_space((ui.available_width() - w).max(0.0) / 2.0);
-                        ui.spinner();
-                        ui.label(
-                            RichText::new(format!("Looking for your {platform_name}…"))
-                                .font(body(18.0))
-                                .color(MUTED),
-                        );
-                    });
+                    // Measured, so spinner and text sit centred together whatever the name is.
+                    let text = format!("Looking for your {platform_name}…");
+                    let galley = ui.painter().layout_no_wrap(text, body(18.0), MUTED);
+                    let w = 18.0 + space::S + galley.size().x;
+                    let (rect, _) = ui.allocate_exact_size(
+                        vec2(w, galley.size().y.max(18.0)),
+                        egui::Sense::hover(),
+                    );
+                    spinner_at(ui, egui::pos2(rect.left() + 9.0, rect.center().y), 7.0, MUTED);
+                    ui.painter().galley(
+                        egui::pos2(
+                            rect.left() + 18.0 + space::S,
+                            rect.center().y - galley.size().y / 2.0,
+                        ),
+                        galley,
+                        MUTED,
+                    );
                 }
                 (Some(Err(e)), _) => {
                     ui.label(
-                        RichText::new("Could not reach the Xbox service")
+                        RichText::new(format!("Could not reach the {platform_name} service"))
                             .font(bold(18.0))
                             .color(INK),
                     );
-                    hint(ui, e);
+                    error_text(ui, e);
                     if small_link(ui, "Try again").clicked() {
                         refresh = true;
                     }
@@ -1527,41 +1741,46 @@ impl XMouseApp {
                 true,
             ));
         }
-        let w = cards.len() as f32 * 276.0;
-        centered_row(ui, w, |ui| {
-            ui.spacing_mut().item_spacing.x = 16.0;
-            for (id, name, sub, installed) in &cards {
-                ui.vertical(|ui| {
-                    ui.set_width(260.0);
-                    ui.spacing_mut().item_spacing.y = 8.0;
-                    if *installed {
-                        if primary(ui, name, 260.0).clicked() {
-                            choice = Some(id.clone());
+        // As many cards side by side as fit; more console types wrap onto another line
+        // instead of running out of the window.
+        for line in cards.chunks(per_line(ui.available_width(), 260.0, space::L)) {
+            let w = line.len() as f32 * (260.0 + space::L) - space::L;
+            centered_row(ui, w, |ui| {
+                ui.spacing_mut().item_spacing.x = space::L;
+                for (id, name, sub, installed) in line {
+                    ui.vertical(|ui| {
+                        ui.set_width(260.0);
+                        ui.spacing_mut().item_spacing.y = space::S;
+                        if *installed {
+                            if primary(ui, name, 260.0).clicked() {
+                                choice = Some(id.clone());
+                            }
+                            hint(ui, sub);
+                            return;
                         }
-                        ui.label(RichText::new(sub).font(body(14.0)).color(MUTED));
-                        return;
-                    }
-                    // Not installed: a grey button that can't be clicked, and the way to get it.
-                    crate::theme::button3d(ui, name, 260.0, crate::theme::IDLE, EDGE, false)
-                        .on_hover_text(format!("Install {PSNBRIDGE_NAME} to play on a PlayStation"));
-                    ui.label(RichText::new(sub).font(bold(14.0)).color(SIGNAL));
-                    let label = if installing {
-                        "Installing…".to_string()
-                    } else {
-                        format!("Install {PSNBRIDGE_NAME}")
-                    };
-                    if crate::theme::button3d(ui, &label, 260.0, KEY, EDGE, !installing).clicked() {
-                        install = true;
-                    }
-                    match &install_error {
-                        Some(e) => {
-                            ui.label(RichText::new(e).font(body(13.5)).color(SIGNAL));
+                        // Not installed: a grey button that can't be clicked, and the way to
+                        // get it.
+                        button3d(ui, name, 260.0, IDLE, EDGE, false).on_hover_text(format!(
+                            "Install {PSNBRIDGE_NAME} to play on a PlayStation"
+                        ));
+                        ui.label(RichText::new(sub).font(bold(14.0)).color(SIGNAL_TEXT));
+                        let label = if installing {
+                            "Installing…".to_string()
+                        } else {
+                            format!("Install {PSNBRIDGE_NAME}")
+                        };
+                        if busy_button(ui, &label, 260.0, KEY, EDGE, installing).clicked() {
+                            install = true;
                         }
-                        None => hint(ui, "Downloads the free PlayStation plugin (AGPL-3.0)."),
-                    }
-                });
-            }
-        });
+                        match &install_error {
+                            Some(e) => error_text(ui, e),
+                            None => hint(ui, "Downloads the free PlayStation plugin (AGPL-3.0)."),
+                        }
+                    });
+                }
+            });
+            ui.add_space(space::M);
+        }
         if install {
             self.install_psnbridge();
         }
@@ -1582,11 +1801,11 @@ impl XMouseApp {
             ui.vertical_centered(|ui| {
                 ui.label(
                     RichText::new("Your PSN account")
-                        .font(display(32.0))
+                        .font(display(34.0))
                         .color(INK),
                 );
             });
-            ui.add_space(10.0);
+            ui.add_space(space::M);
             hint(
                 ui,
                 &format!(
@@ -1595,19 +1814,24 @@ impl XMouseApp {
                     p.name
                 ),
             );
-            ui.add_space(8.0);
-            let edit = ui.add(
+            ui.add_space(space::M);
+            let edit = text_field(
+                ui,
                 egui::TextEdit::singleline(&mut draft)
                     .hint_text("PSN account ID")
                     .char_limit(64)
+                    .font(medium(15.0))
+                    .margin(vec2(10.0, 8.0))
                     .desired_width(f32::INFINITY),
             );
             if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 save = true;
             }
-            ui.add_space(10.0);
+            ui.add_space(space::M);
             ui.horizontal(|ui| {
-                if primary(ui, "Continue", 160.0).clicked() {
+                // Nothing to continue with yet: the button says so instead of ignoring the click.
+                let ready = !draft.trim().is_empty();
+                if button3d(ui, "Continue", 160.0, SIGNAL, SIGNAL_EDGE, ready).clicked() {
                     save = true;
                 }
                 if secondary(ui, "Other console", 160.0).clicked() {
@@ -1718,7 +1942,19 @@ impl XMouseApp {
                 } else {
                     "PlayStation · not installed · click to install".to_string()
                 };
-                if row(ui, true, name, &sub, RowOptions::link(), |_| {}).clicked() && !installing {
+                // While it installs the row shows the spinner where its arrow was.
+                let opts = RowOptions {
+                    chevron: !installing,
+                    danger: !installing && install_error.is_some(),
+                    ..RowOptions::link()
+                };
+                let clicked = row(ui, true, name, &sub, opts, |ui| {
+                    if installing {
+                        spinner(ui);
+                    }
+                })
+                .clicked();
+                if clicked && !installing {
                     install = true;
                 }
                 open_plugins = row(
@@ -1810,46 +2046,47 @@ impl XMouseApp {
         let mut refresh = false;
         match &consoles {
             Some(Ok(list)) if !list.is_empty() => {
-                let w = list.len() as f32 * 236.0;
-                centered_row(ui, w, |ui| {
-                    ui.spacing_mut().item_spacing.x = 16.0;
-                    for c in list {
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 6.0;
-                            let r = if c.server_id == self.settings.last_console {
-                                primary(ui, &c.name, 220.0)
-                            } else {
-                                secondary(ui, &c.name, 220.0)
-                            };
-                            if r.clicked() {
-                                pick = Some(c.clone());
-                            }
-                            ui.label(
-                                RichText::new(format!("{} · {}", c.type_label(), c.power_label()))
-                                    .font(body(14.0))
-                                    .color(MUTED),
-                            );
-                            if c.power_state != "On" && small_link(ui, "Wake").clicked() {
-                                wake = Some(c.clone());
-                            }
-                        });
-                    }
-                });
+                // Many consoles wrap onto more lines instead of running out of the window.
+                for line in list.chunks(per_line(ui.available_width(), 220.0, space::L)) {
+                    let w = line.len() as f32 * (220.0 + space::L) - space::L;
+                    centered_row(ui, w, |ui| {
+                        ui.spacing_mut().item_spacing.x = space::L;
+                        for c in line {
+                            ui.vertical(|ui| {
+                                ui.set_width(220.0);
+                                ui.spacing_mut().item_spacing.y = space::S;
+                                let r = if c.server_id == self.settings.last_console {
+                                    primary(ui, &c.name, 220.0)
+                                } else {
+                                    secondary(ui, &c.name, 220.0)
+                                };
+                                if r.clicked() {
+                                    pick = Some(c.clone());
+                                }
+                                hint(ui, &format!("{} · {}", c.type_label(), c.power_label()));
+                                if c.power_state != "On" && small_link(ui, "Wake").clicked() {
+                                    wake = Some(c.clone());
+                                }
+                            });
+                        }
+                    });
+                    ui.add_space(space::M);
+                }
             }
             Some(Ok(_)) => {
                 let msg = format!("No consoles found. Check the {} setup.", self.platform_name());
                 ui.vertical_centered(|ui| hint(ui, &msg));
             }
             Some(Err(e)) => {
-                ui.vertical_centered(|ui| hint(ui, e));
+                ui.vertical_centered(|ui| error_text(ui, e));
             }
             None => {
                 ui.vertical_centered(|ui| {
-                    ui.spinner();
+                    spinner(ui);
                 });
             }
         }
-        ui.add_space(14.0);
+        ui.add_space(space::M);
         ui.vertical_centered(|ui| {
             if small_link(ui, "Look for consoles again").clicked() {
                 refresh = true;
@@ -1958,22 +2195,22 @@ impl XMouseApp {
                 section(ui, "This profile");
                 group(ui, |ui| {
                     control_row(ui, true, "Name", "", |ui| {
-                        changed |= ui
-                            .add(
-                                egui::TextEdit::singleline(&mut p.name)
-                                    .desired_width(220.0)
-                                    .font(medium(15.0)),
-                            )
-                            .changed();
+                        changed |= text_field(
+                            ui,
+                            egui::TextEdit::singleline(&mut p.name)
+                                .desired_width(220.0)
+                                .font(medium(15.0)),
+                        )
+                        .changed();
                     });
                     control_row(ui, false, "Game", "", |ui| {
-                        changed |= ui
-                            .add(
-                                egui::TextEdit::singleline(&mut p.game)
-                                    .desired_width(220.0)
-                                    .font(medium(15.0)),
-                            )
-                            .changed();
+                        changed |= text_field(
+                            ui,
+                            egui::TextEdit::singleline(&mut p.game)
+                                .desired_width(220.0)
+                                .font(medium(15.0)),
+                        )
+                        .changed();
                     });
                     if !p.notes.is_empty() {
                         egui::Frame::new()
@@ -2121,10 +2358,13 @@ impl XMouseApp {
                         self.mark_dirty();
                     }
                 }
+                // Every key, button and wheel event brings a frame by itself; this is only
+                // a slow safety net (it used to redraw the page flat out while waiting).
+                ctx.request_repaint_after(Duration::from_millis(100));
             } else {
                 reset_next_input(ctx);
+                ctx.request_repaint();
             }
-            ctx.request_repaint();
         }
 
         if self.editor.layer >= self.profiles[cur].layers.len() {
@@ -2171,6 +2411,9 @@ impl XMouseApp {
         }
         if let Some(v) = new_view {
             self.editor.list_view = v;
+            // A key pick that was waiting belongs to the list: don't let it grab the next
+            // click on the drawn keyboard.
+            self.editor.listening = None;
         }
         ui.add_space(10.0);
         if !self.editor.list_view {
@@ -2246,9 +2489,9 @@ impl XMouseApp {
                     }
                 });
                 if li > 0 {
-                    hint(
+                    hint_indented(
                         ui,
-                        &format!("   Keys not listed here use the “{base_name}” layer."),
+                        &format!("Keys not listed here use the “{base_name}” layer."),
                     );
                 }
             } else {
@@ -2261,14 +2504,14 @@ impl XMouseApp {
                             .map(|(l, i, _)| l == li && i == bi)
                             .unwrap_or(false);
                         control_row(ui, true, "Name", "What it does in the game.", |ui| {
-                            changed |= ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut b.label)
-                                        .hint_text("e.g. Shoot")
-                                        .desired_width(200.0)
-                                        .font(medium(15.0)),
-                                )
-                                .changed();
+                            changed |= text_field(
+                                ui,
+                                egui::TextEdit::singleline(&mut b.label)
+                                    .hint_text("e.g. Shoot")
+                                    .desired_width(200.0)
+                                    .font(medium(15.0)),
+                            )
+                            .changed();
                         });
                         row(
                             ui,
@@ -2371,11 +2614,12 @@ impl XMouseApp {
                     control_row(ui, false, "New layer", "e.g. Vehicle", |ui| {
                         add_layer =
                             keycap_sized(ui, "Add", bold(14.0), 28.0, false, true).clicked();
-                        ui.add(
+                        text_field(
+                            ui,
                             egui::TextEdit::singleline(new_layer)
                                 .hint_text("Name")
                                 .desired_width(120.0)
-                                .font(medium(14.5)),
+                                .font(medium(15.0)),
                         );
                     });
                     if li > 0 {
@@ -2402,10 +2646,7 @@ impl XMouseApp {
                     )
                     .clicked();
                 });
-                hint(
-                    ui,
-                    "   While choosing a key: Esc cancels, Shift+Esc binds Esc.",
-                );
+                hint_indented(ui, "While choosing a key: Esc cancels, Shift+Esc binds Esc.");
             }
         });
 
@@ -2482,8 +2723,20 @@ impl XMouseApp {
     fn keys_picture(&mut self, ui: &mut Ui, li: usize) {
         let cur = self.current;
         let defs = crate::keyboard::layout();
-        let panel_w = 390.0;
-        let kb_w = (ui.available_width() - panel_w - 28.0).max(560.0);
+        // Keyboard and panel side by side when the keyboard stays readable; in a narrow
+        // window the panel goes underneath instead of being cut off at the right edge.
+        let avail = ui.available_width();
+        let stacked = avail - 390.0 - 28.0 < 560.0;
+        let (kb_w, panel_w) = if stacked {
+            (avail, avail.min(560.0))
+        } else {
+            (avail - 390.0 - 28.0, 390.0)
+        };
+        let arrangement = if stacked {
+            egui::Layout::top_down(egui::Align::Min)
+        } else {
+            egui::Layout::left_to_right(egui::Align::Min)
+        };
         let mut clicked: Option<String> = None;
         let mut cmd: Option<PanelCmd> = None;
         let sel = self.editor.key_sel.clone();
@@ -2511,7 +2764,7 @@ impl XMouseApp {
                         }
                     })
             };
-            ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(vec2(avail, 0.0), arrangement, |ui| {
                 ui.vertical(|ui| {
                     ui.set_width(kb_w);
                     // White (bound) only when the key really does something in this layer, the
@@ -2532,7 +2785,7 @@ impl XMouseApp {
                             pad: String::new(),
                         },
                     };
-                    if let Some(code) = crate::keyboard::draw(ui, kb_w, &defs, look, sel.as_deref())
+                    if let Some(code) = crate::keyboard::draw(ui, kb_w, defs, look, sel.as_deref())
                     {
                         clicked = Some(code.to_string());
                     }
@@ -2590,7 +2843,7 @@ impl XMouseApp {
                     ui.add_space(6.0);
                     crate::keyboard::legend(ui);
                     let (mut left, mut right) = (0, 0);
-                    for d in &defs {
+                    for d in defs {
                         if d.usable == crate::keyboard::Usable::Yes
                             && find(d.code).is_some_and(|(b, _)| b.does_something())
                         {
@@ -2752,11 +3005,11 @@ impl XMouseApp {
                     let cur_i = levels
                         .iter()
                         .enumerate()
+                        // total_cmp: a profile file with a broken number must not crash the page.
                         .min_by(|a, b| {
                             (a.1 - m.smoothing)
                                 .abs()
-                                .partial_cmp(&(b.1 - m.smoothing).abs())
-                                .unwrap()
+                                .total_cmp(&(b.1 - m.smoothing).abs())
                         })
                         .map(|x| x.0)
                         .unwrap_or(0);
@@ -3271,10 +3524,6 @@ impl XMouseApp {
         narrow(ui, 640.0, |ui| {
             section(ui, "On your Xbox");
             setup_group(ui);
-            section(ui, "Always-on box");
-            group(ui, |ui| {
-                row(ui, true, "Raspberry Pi or mini PC", "Start with --autostart --kiosk to open TV Play on the last console, fullscreen.", RowOptions::default(), |_| {});
-            });
         });
     }
 
@@ -3409,17 +3658,22 @@ impl XMouseApp {
 
         let (frame, layer, pname, legend) = {
             let m = s.shared.mapper.lock().unwrap();
-            let legend: Vec<(String, String)> = m
-                .layer_bindings()
-                .iter()
-                .filter(|b| b.action != Action::None || b.switch_layer.is_some())
-                .map(|b| (input_label(&b.input), b.title().to_string()))
-                .collect();
+            // The key list only changes with the layer (a session can't edit bindings), so
+            // it is built once per layer instead of on every frame with the mapper locked.
+            if s.legend.0.as_deref() != Some(m.layer_name()) {
+                let rows: Vec<(String, String)> = m
+                    .layer_bindings()
+                    .iter()
+                    .filter(|b| b.action != Action::None || b.switch_layer.is_some())
+                    .map(|b| (input_label(&b.input), b.title().to_string()))
+                    .collect();
+                s.legend = (Some(m.layer_name().to_string()), Arc::new(rows));
+            }
             (
                 m.last_frame,
                 m.layer_name().to_string(),
                 m.profile().name.clone(),
-                legend,
+                s.legend.1.clone(),
             )
         };
         let mode_name = if s.mode == PlayMode::Tv {
@@ -3427,9 +3681,18 @@ impl XMouseApp {
         } else {
             "PC Play"
         };
+        let enter = self.nav.show(
+            ctx,
+            View::Session(match (connected, s.captured) {
+                (false, _) => 0,
+                (true, false) => 1,
+                (true, true) => 2,
+            }),
+        );
         {
             let back = if s.captured { None } else { Some("Disconnect") };
-            if top_bar(ui, back, Some(format!("{mode_name}  "))) {
+            let back_fade = self.nav.back_fade(ctx, back);
+            if top_bar(ui, back, Some(format!("{mode_name}  ")), back_fade) {
                 end = true;
             }
             let line = if connected {
@@ -3451,15 +3714,33 @@ impl XMouseApp {
             status_bar(ui, &line);
         }
 
+        // Plugin consoles (other platforms) are called by their own name.
+        let plugin_console = plugin_console_ref(&s.console.server_id).is_some();
+        let console_word: &str = if !plugin_console {
+            "Xbox"
+        } else if crate::profile::playstation_names() {
+            "PlayStation"
+        } else {
+            &s.console.name
+        };
+        // The name of PC Play's own window, as its title bar shows it.
+        let window_word: &str = if plugin_console { &s.console.name } else { "Xbox" };
         egui::CentralPanel::default()
             .frame(page_frame())
-            .show(ui, |ui| {
+            .show(ui, |ui| entering(ui, enter, |ui| {
                 if !connected {
                     title(ui, "Connecting", &s.console.name);
                     narrow(ui, 600.0, |ui| {
                         group(ui, |ui| {
                             let steps = [
-                                (Phase::Starting, "Ask Xbox to start a session"),
+                                (
+                                    Phase::Starting,
+                                    if plugin_console {
+                                        "Ask the console to start a session"
+                                    } else {
+                                        "Ask Xbox to start a session"
+                                    },
+                                ),
                                 (Phase::WaitingForConsole, "Wait for your console"),
                                 (Phase::Connecting, "Connect over your home network"),
                             ];
@@ -3486,7 +3767,7 @@ impl XMouseApp {
                                     },
                                     |ui| {
                                         if i == cur {
-                                            ui.spinner();
+                                            spinner(ui);
                                         }
                                     },
                                 );
@@ -3495,7 +3776,6 @@ impl XMouseApp {
                     });
                     return;
                 }
-                let console_word = "Xbox";
                 ui.add_space((ui.available_height() * 0.16).max(20.0));
                 ui.vertical_centered(|ui| {
                     ui.spacing_mut().item_spacing.y = 12.0;
@@ -3507,9 +3787,11 @@ impl XMouseApp {
                         );
                         ui.label(
                             RichText::new(if s.mode == PlayMode::Tv {
-                                "The picture is on the TV. F8 pauses."
+                                "The picture is on the TV. F8 pauses.".to_string()
                             } else {
-                                "The picture is in the XMouse – Xbox window. F8 pauses."
+                                format!(
+                                    "The picture is in the XMouse – {window_word} window. F8 pauses."
+                                )
                             })
                             .font(body(18.0))
                             .color(MUTED),
@@ -3534,8 +3816,11 @@ impl XMouseApp {
                         ui.label(
                             RichText::new(if s.mode == PlayMode::Tv {
                                 "Press Play, then look at your TV. F8 pauses at any time."
+                                    .to_string()
                             } else {
-                                "Press Play. The picture is in the XMouse – Xbox window."
+                                format!(
+                                    "Press Play. The picture is in the XMouse – {window_word} window."
+                                )
                             })
                             .font(body(18.0))
                             .color(MUTED),
@@ -3555,7 +3840,7 @@ impl XMouseApp {
                         );
                     }
                 });
-            });
+            }));
 
         if !pc_window {
             if s.captured {
@@ -3692,6 +3977,8 @@ fn player_window(
                         egui::Align2::CENTER_CENTER,
                         if connected {
                             "Waiting for the picture…"
+                        } else if plugin_console_ref(&s.console.server_id).is_some() {
+                            "Connecting to your console…"
                         } else {
                             "Connecting to your Xbox…"
                         },
@@ -3919,27 +4206,33 @@ fn game_tip(ctx: &egui::Context, s: &mut Session, connected: bool, picture: egui
     if age > TIP_SECS {
         return;
     }
-    // Fade in quickly, out over the last 1.5 s.
-    let fade = (age / 0.4).min((TIP_SECS - age) / 1.5).clamp(0.0, 1.0);
-    // Name the keys this profile uses for the Xbox button and A.
+    // Ease in quickly (settling down into place), ease out over the last 1.5 s.
+    let fade_in = motion::ease_out(age / 0.4);
+    let fade = fade_in.min(1.0 - motion::ease_out(1.0 - (TIP_SECS - age) / 1.5));
+    // Name the keys this profile uses for the console's home button and A / Cross.
     let key_for = |action: Action| -> Option<String> {
         let m = s.shared.mapper.lock().unwrap();
         m.profile()
             .layers
             .first()
-            .and_then(|l| l.bindings.iter().find(|b| b.action == action))
+            .and_then(|l| l.bindings.iter().find(|b| b.action == action && !b.input.is_empty()))
             .map(|b| input_label(&b.input))
     };
+    // "Xbox button" / "A", or "PS button" / "Cross" on a PlayStation.
+    let (home_name, a_name) = (Action::Nexus.label(), Action::A.label());
     let xbox = key_for(Action::Nexus)
-        .map(|k| format!("{k} (Xbox button)"))
-        .unwrap_or_else(|| "the Xbox button".into());
+        .map(|k| format!("{k} ({home_name})"))
+        .unwrap_or_else(|| format!("the {home_name}"));
     let a = key_for(Action::A)
-        .map(|k| format!("{k} (A)"))
-        .unwrap_or_else(|| "A".into());
+        .map(|k| format!("{k} ({a_name})"))
+        .unwrap_or_else(|| a_name.into());
     let white = |alpha: f32| Color32::from_white_alpha((alpha * fade * 255.0) as u8);
     egui::Area::new(egui::Id::unique("game-tip"))
         .pivot(egui::Align2::CENTER_TOP)
-        .fixed_pos(egui::pos2(picture.center().x, picture.top() + 24.0))
+        .fixed_pos(egui::pos2(
+            picture.center().x,
+            picture.top() + 24.0 - 8.0 * (1.0 - fade_in),
+        ))
         .interactable(false)
         .show(ctx, |ui| {
             egui::Frame::new()
@@ -4305,11 +4598,12 @@ fn key_panel(
                 };
                 ui.label(RichText::new(now).font(body(15.0)).color(MUTED));
                 ui.add_space(8.0);
-                ui.add(
+                text_field(
+                    ui,
                     egui::TextEdit::singleline(search)
                         .hint_text("Search actions")
                         .desired_width(f32::INFINITY)
-                        .font(body(15.5))
+                        .font(medium(15.0))
                         .margin(vec2(10.0, 8.0)),
                 );
             });
@@ -4368,14 +4662,14 @@ fn key_panel(
         group(ui, |ui| {
             let mut name = b.label.clone();
             control_row(ui, true, "Name", "What it does in the game.", |ui| {
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut name)
-                            .hint_text("e.g. Reload")
-                            .desired_width(170.0)
-                            .font(medium(15.0)),
-                    )
-                    .changed()
+                if text_field(
+                    ui,
+                    egui::TextEdit::singleline(&mut name)
+                        .hint_text("e.g. Reload")
+                        .desired_width(170.0)
+                        .font(medium(15.0)),
+                )
+                .changed()
                 {
                     cmd = Some(PanelCmd::Name(name.clone()));
                 }
@@ -4448,4 +4742,67 @@ fn key_panel(
         });
     }
     cmd
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_transitions_go_the_way_you_navigate() {
+        let page = View::Page;
+        assert_eq!(transition_direction(page(Page::Home), page(Page::More)), 1.0);
+        assert_eq!(transition_direction(page(Page::More), page(Page::Keys)), 1.0);
+        assert_eq!(transition_direction(page(Page::Keys), page(Page::Test)), 1.0);
+        assert_eq!(transition_direction(page(Page::Test), page(Page::Keys)), -1.0);
+        assert_eq!(transition_direction(page(Page::Keys), page(Page::More)), -1.0);
+        assert_eq!(transition_direction(page(Page::Consoles), page(Page::Home)), -1.0);
+        // Same depth, or not between pages at all: a plain rise.
+        assert_eq!(transition_direction(page(Page::Keys), page(Page::Mouse)), 0.0);
+        assert_eq!(transition_direction(View::Platform, page(Page::Home)), 0.0);
+        assert_eq!(transition_direction(page(Page::Home), View::Session(0)), 0.0);
+    }
+
+    #[test]
+    fn nav_animates_changes_but_not_the_first_view() {
+        let ctx = egui::Context::default();
+        let mut nav = Nav::new();
+        let frame = |nav: &mut Nav, time: f64, view: View| {
+            let mut out = (0.0, 0.0);
+            let input = egui::RawInput {
+                time: Some(time),
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| out = nav.show(ui.ctx(), view));
+            out
+        };
+        assert_eq!(frame(&mut nav, 0.0, View::Page(Page::Home)).0, 1.0, "no fade at launch");
+        assert!(!nav.fresh);
+        let (t, dir) = frame(&mut nav, 1.0, View::Page(Page::More));
+        assert_eq!((t, dir), (0.0, 1.0), "a new page starts invisible, coming from the right");
+        assert!(nav.fresh, "and scrolled to its top");
+        let (mid, _) = frame(&mut nav, 1.0 + motion::SLOW as f64 / 2.0, View::Page(Page::More));
+        assert!(mid > 0.5 && mid < 1.0, "eased: more than half way at half time, got {mid}");
+        assert_eq!(frame(&mut nav, 2.0, View::Page(Page::More)).0, 1.0);
+        assert_eq!(frame(&mut nav, 3.0, View::Page(Page::Home)), (0.0, -1.0));
+    }
+
+    #[test]
+    fn toasts_stay_long_enough_to_read_and_ease_in_and_out() {
+        assert_eq!(toast_secs("Signed in"), 5.0);
+        assert!(toast_secs(&"x".repeat(120)) > 9.0);
+        assert_eq!(toast_secs(&"x".repeat(2000)), 12.0);
+        assert_eq!(toast_phase(0.0, 5.0), (0.0, 1.0));
+        assert_eq!(toast_phase(1.0, 4.0), (1.0, 1.0));
+        assert_eq!(toast_phase(5.0, 0.0), (1.0, 0.0));
+        let (t_in, _) = toast_phase(motion::SLOW / 2.0, 4.0);
+        assert!(t_in > 0.5 && t_in < 1.0);
+    }
+
+    #[test]
+    fn cards_wrap_instead_of_overflowing() {
+        assert_eq!(per_line(852.0, 260.0, 16.0), 3);
+        assert_eq!(per_line(1232.0, 220.0, 16.0), 5);
+        assert_eq!(per_line(100.0, 260.0, 16.0), 1, "never zero");
+    }
 }

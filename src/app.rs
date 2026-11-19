@@ -55,6 +55,11 @@ struct Bg {
     plugins_loaded: bool,
     /// Outcome of the last pairing attempt, picked up by the pairing window.
     pair_result: Option<Result<(), String>>,
+    /// PSNBridge is being downloaded and installed / the last attempt's error / it finished
+    /// and the plugins need scanning again.
+    installing: bool,
+    install_error: Option<String>,
+    install_done: bool,
     toasts: Vec<(String, bool)>,
 }
 
@@ -203,6 +208,13 @@ impl XMouseApp {
                 ));
             }
         }
+        let plugins = crate::plugin::discover();
+        // Someone already playing on Xbox (signed in, no console plugins) keeps going straight
+        // to their Xbox after updating; new users and plugin users pick their console first.
+        if settings.console_platform.is_empty() && signed_in && !demo && plugins.is_empty() {
+            settings.console_platform = "xbox".into();
+            storage.save_settings(&settings);
+        }
         let current = profiles
             .iter()
             .position(|p| p.id == settings.last_profile)
@@ -239,7 +251,7 @@ impl XMouseApp {
             toasts: startup_toasts,
             autostart: opts.autostart,
             play_on_start: opts.play,
-            plugins: crate::plugin::discover(),
+            plugins,
             pairing: None,
             ctx: cc.egui_ctx.clone(),
             frame_no: 0,
@@ -515,15 +527,56 @@ impl XMouseApp {
         }
     }
 
-    /// A console plugin is installed and you haven't picked Xbox or a plugin's console yet
-    /// (or the plugin you picked was removed).
+    /// You haven't picked Xbox or a plugin's console yet (or the plugin you picked was removed).
     fn choosing_platform(&self) -> bool {
-        !self.plugins.is_empty()
-            && match self.settings.console_platform.as_str() {
-                "" => true,
-                "xbox" => false,
-                id => self.plugin(id).is_none(),
+        match self.settings.console_platform.as_str() {
+            "" => true,
+            "xbox" => false,
+            id => self.plugin(id).is_none(),
+        }
+    }
+
+    /// Download and install PSNBridge (the PlayStation plugin) in the background.
+    fn install_psnbridge(&self) {
+        let (bg, ctx) = (self.bg.clone(), self.ctx.clone());
+        {
+            let mut b = bg.lock().unwrap();
+            if b.installing {
+                return;
             }
+            b.installing = true;
+            b.install_error = None;
+        }
+        self.rt.spawn(async move {
+            let res =
+                crate::plugin::install::install_psnbridge(&crate::plugin::plugins_dir()).await;
+            let mut b = bg.lock().unwrap();
+            b.installing = false;
+            match res {
+                Ok(p) => {
+                    log::info!("installed plugin {} {}", p.id, p.version);
+                    b.install_done = true;
+                    b.toasts.push((format!("{} {} installed", p.name, p.version), false));
+                }
+                Err(e) => {
+                    log::warn!("PSNBridge install: {e}");
+                    b.install_error = Some(e);
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    /// After an install: pick up the new plugin.
+    fn finish_install(&mut self) {
+        if !std::mem::take(&mut self.bg.lock().unwrap().install_done) {
+            return;
+        }
+        self.plugins = crate::plugin::discover();
+        self.apply_platform_names();
+        if self.platform_plugin().is_some() {
+            self.load_plugin_consoles();
+        }
     }
 
     /// "Xbox", or the plugin's platform (e.g. "PlayStation").
@@ -883,6 +936,7 @@ impl eframe::App for XMouseApp {
             self.toast(m, e);
         }
         self.pairing_window(&ctx);
+        self.finish_install();
 
         let signed_in = self.bg.lock().unwrap().signed_in;
         let platform = self.platform_plugin();
@@ -1436,34 +1490,81 @@ impl XMouseApp {
             hint(ui, "You can change this later under More.");
         });
         ui.add_space(22.0);
+        use crate::plugin::install::{PSNBRIDGE_ID, PSNBRIDGE_NAME};
         let mut choice: Option<String> = None;
-        let cards: Vec<(String, String, String)> = std::iter::once((
-            "xbox".to_string(),
-            "Xbox".to_string(),
-            "Sign in with your Microsoft account".to_string(),
-        ))
-        .chain(self.plugins.iter().map(|p| {
-            (
+        let mut install = false;
+        let (installing, install_error) = {
+            let b = self.bg.lock().unwrap();
+            (b.installing, b.install_error.clone())
+        };
+        // (id, button, line under it, installed). PlayStation is always offered: greyed out
+        // with an Install button while PSNBridge is missing.
+        let mut cards: Vec<(String, String, String, bool)> = vec![(
+            "xbox".into(),
+            "Xbox".into(),
+            "Sign in with your Microsoft account".into(),
+            true,
+        )];
+        match self.plugin(PSNBRIDGE_ID) {
+            Some(p) => cards.push((
                 p.id.clone(),
                 p.platform.clone(),
                 format!("Through the {} plugin ({})", p.name, p.license),
-            )
-        }))
-        .collect();
+                true,
+            )),
+            None => cards.push((
+                PSNBRIDGE_ID.into(),
+                "PlayStation".into(),
+                format!("{PSNBRIDGE_NAME} missing"),
+                false,
+            )),
+        }
+        for p in self.plugins.iter().filter(|p| p.id != PSNBRIDGE_ID) {
+            cards.push((
+                p.id.clone(),
+                p.platform.clone(),
+                format!("Through the {} plugin ({})", p.name, p.license),
+                true,
+            ));
+        }
         let w = cards.len() as f32 * 276.0;
         centered_row(ui, w, |ui| {
             ui.spacing_mut().item_spacing.x = 16.0;
-            for (id, name, sub) in &cards {
+            for (id, name, sub, installed) in &cards {
                 ui.vertical(|ui| {
                     ui.set_width(260.0);
                     ui.spacing_mut().item_spacing.y = 8.0;
-                    if primary(ui, name, 260.0).clicked() {
-                        choice = Some(id.clone());
+                    if *installed {
+                        if primary(ui, name, 260.0).clicked() {
+                            choice = Some(id.clone());
+                        }
+                        ui.label(RichText::new(sub).font(body(14.0)).color(MUTED));
+                        return;
                     }
-                    ui.label(RichText::new(sub).font(body(14.0)).color(MUTED));
+                    // Not installed: a grey button that can't be clicked, and the way to get it.
+                    crate::theme::button3d(ui, name, 260.0, crate::theme::IDLE, EDGE, false)
+                        .on_hover_text(format!("Install {PSNBRIDGE_NAME} to play on a PlayStation"));
+                    ui.label(RichText::new(sub).font(bold(14.0)).color(SIGNAL));
+                    let label = if installing {
+                        "Installing…".to_string()
+                    } else {
+                        format!("Install {PSNBRIDGE_NAME}")
+                    };
+                    if crate::theme::button3d(ui, &label, 260.0, KEY, EDGE, !installing).clicked() {
+                        install = true;
+                    }
+                    match &install_error {
+                        Some(e) => {
+                            ui.label(RichText::new(e).font(body(13.5)).color(SIGNAL));
+                        }
+                        None => hint(ui, "Downloads the free PlayStation plugin (AGPL-3.0)."),
+                    }
                 });
             }
         });
+        if install {
+            self.install_psnbridge();
+        }
         if let Some(id) = choice {
             self.set_platform(&id);
         }
@@ -1536,8 +1637,14 @@ impl XMouseApp {
         let mut change_platform = false;
         let mut change_account = false;
         let xbox = self.platform_plugin().is_none();
-        let has_plugins = !self.plugins.is_empty();
         let platform_name = self.platform_name();
+        let mut install = false;
+        let mut open_plugins = false;
+        let bridge = self.plugin(crate::plugin::install::PSNBRIDGE_ID);
+        let (installing, install_error) = {
+            let b = self.bg.lock().unwrap();
+            (b.installing, b.install_error.clone())
+        };
         narrow(ui, 600.0, |ui| {
             section(ui, "This game");
             group(ui, |ui| {
@@ -1586,19 +1693,43 @@ impl XMouseApp {
                         go = Some(pg);
                     }
                 }
-                if has_plugins
-                    && row(
-                        ui,
-                        false,
-                        "Console type",
-                        &format!("{platform_name} · change to another console"),
-                        RowOptions::link(),
-                        |_| {},
-                    )
-                    .clicked()
+                if row(
+                    ui,
+                    false,
+                    "Console type",
+                    &format!("{platform_name} · change to another console"),
+                    RowOptions::link(),
+                    |_| {},
+                )
+                .clicked()
                 {
                     change_platform = true;
                 }
+            });
+            section(ui, "Plugins");
+            group(ui, |ui| {
+                let name = crate::plugin::install::PSNBRIDGE_NAME;
+                let sub = if installing {
+                    "Installing…".to_string()
+                } else if let Some(e) = &install_error {
+                    e.clone()
+                } else if let Some(p) = &bridge {
+                    format!("PlayStation · version {} installed · click to update", p.version)
+                } else {
+                    "PlayStation · not installed · click to install".to_string()
+                };
+                if row(ui, true, name, &sub, RowOptions::link(), |_| {}).clicked() && !installing {
+                    install = true;
+                }
+                open_plugins = row(
+                    ui,
+                    false,
+                    "Plugins folder",
+                    "Where plugins are installed",
+                    RowOptions::link(),
+                    |_| {},
+                )
+                .clicked();
             });
             section(ui, "Account");
             group(ui, |ui| {
@@ -1628,6 +1759,16 @@ impl XMouseApp {
                 }
             });
         });
+        if install {
+            self.install_psnbridge();
+        }
+        if open_plugins {
+            let dir = crate::plugin::plugins_dir();
+            let _ = std::fs::create_dir_all(&dir);
+            if let Err(e) = std::process::Command::new("explorer.exe").arg(&dir).spawn() {
+                self.toast(format!("Couldn't open {}: {e}", dir.display()), true);
+            }
+        }
         if change_platform {
             self.set_platform("");
             return;

@@ -36,11 +36,13 @@
 //! - [`run_plugin_session`] plays, reporting through the same `Shared` an Xbox session uses.
 
 pub mod host;
+pub mod install;
 pub mod manifest;
 pub mod proto;
 pub mod session;
 
 pub use host::{list_consoles, pair, wake, PluginClient, PluginConsole, PluginHello};
+pub use install::{install_psnbridge, install_zip, psnbridge_source, PSNBRIDGE_ID, PSNBRIDGE_NAME};
 pub use manifest::{discover, discover_in, plugins_dir, PluginInfo};
 pub use proto::{ConsoleState, API_VERSION};
 pub use session::{run_plugin_session, PluginSessionConfig, PluginStats};

@@ -26,6 +26,8 @@ url = "2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 opus = "0.3"
 cpal = "0.18.2"
+# Unpacking a plugin's release zip (src/plugin/install.rs): stored and deflate only.
+zip = { version = "9.6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [target.'cfg(windows)'.dependencies]
 # timeBeginPeriod(1): 1 ms timer resolution for the input loop (Windows defaults to ~15.6 ms).

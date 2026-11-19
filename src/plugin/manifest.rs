@@ -74,7 +74,10 @@ pub fn discover_in(dir: &Path) -> (Vec<PluginInfo>, Vec<(PathBuf, String)>) {
     };
     for entry in entries.flatten().take(MAX_PLUGINS) {
         let path = entry.path();
-        if !path.is_dir() {
+        // Folders starting with a dot are not plugins (an id can't start with one): the
+        // installer keeps its half-finished work in `.install-…` (see `install`).
+        let hidden = entry.file_name().to_string_lossy().starts_with('.');
+        if hidden || !path.is_dir() {
             continue;
         }
         match load(&path) {

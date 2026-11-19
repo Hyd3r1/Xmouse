@@ -177,6 +177,30 @@ public static class PadAsset {
     return string.Join("\n", log);
   }
 
+  // How many pixels each side the DualSense lines grow by.
+  const double LineGrow = 1.1;
+
+  // Grow lines by r pixels each side, with a soft edge: each pixel takes the strongest
+  // line pixel within reach, faded over the last pixel of distance.
+  static double[] Thicken(double[] a, double r) {
+    int k = (int)Math.Ceiling(r + 1);
+    var o = new double[W * H];
+    for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+      double best = 0;
+      for (int dy = -k; dy <= k; dy++) {
+        int yy = y + dy; if (yy < 0 || yy >= H) continue;
+        for (int dx = -k; dx <= k; dx++) {
+          int xx = x + dx; if (xx < 0 || xx >= W) continue;
+          double v = a[yy * W + xx]; if (v <= best) continue;
+          double f = Math.Min(1, Math.Max(0, r + 1 - Math.Sqrt(dx * dx + dy * dy)));
+          if (v * f > best) best = v * f;
+        }
+      }
+      o[y * W + x] = best;
+    }
+    return o;
+  }
+
   // The DualSense drawing (531 x 360, thin grey lines): used whole, sticks cut out (the app
   // draws them, rings included), every other control flood-filled from inside its outline.
   public static string BuildPs(string src, string outPath) {
@@ -194,9 +218,14 @@ public static class PadAsset {
     using (var w = new BinaryWriter(File.Create(outPath))) {
       w.Write(new[] { (byte)'X', (byte)'P', (byte)'A', (byte)'D' });
       w.Write((ushort)CW); w.Write((ushort)CH);
-      // Thin grey lines: stretch so they come out solid, and drop the JPEG haze near white.
+      // Thin grey lines: stretch so they come out solid, drop the JPEG haze near white, then
+      // thicken them so they're as bold as the Xbox drawing's at the same size.
+      var a = new double[W * H];
       for (int y = 0; y < H; y++) for (int x = 0; x < W; x++)
-        w.Write(InStick(x, y) ? (byte)0 : (byte)Math.Min(255, Math.Max(0, (int)((238 - lum[y * W + x]) * 2.4))));
+        a[y * W + x] = Math.Min(255, Math.Max(0, (238 - lum[y * W + x]) * 2.4));
+      var thick = Thicken(a, LineGrow);
+      for (int y = 0; y < H; y++) for (int x = 0; x < W; x++)
+        w.Write(InStick(x, y) ? (byte)0 : (byte)Math.Round(thick[y * W + x]));
       w.Write((byte)15);
       Region(w, Fill(new[] { new[] { 105, 18 }, new[] { 90, 21 }, new[] { 125, 15 } }, 55, 3, 150, 38), log, "L1");
       Region(w, Fill(new[] { new[] { 425, 18 }, new[] { 440, 21 }, new[] { 405, 15 } }, 380, 3, 476, 38), log, "R1");

@@ -94,6 +94,18 @@ public static class PadAsset {
     return d;
   }
 
+  // The source drawing has A on the right and B at the bottom; a real Xbox controller has
+  // B on the right and A at the bottom. Swap what's inside the two circles (the letters).
+  const int RightX = 560, RightY = 253, BottomX = 513, BottomY = 296, LetterR = 20;
+
+  static void SwapLetters() {
+    for (int dy = -LetterR; dy <= LetterR; dy++) for (int dx = -LetterR; dx <= LetterR; dx++) {
+      if (dx * dx + dy * dy > LetterR * LetterR) continue;
+      int a = (RightY + dy) * W + RightX + dx, b = (BottomY + dy) * W + BottomX + dx;
+      byte t = lum[a]; lum[a] = lum[b]; lum[b] = t;
+    }
+  }
+
   // Sticks are drawn by the app (so they can move): cut them out of the line art.
   static readonly double[][] Sticks = { new[] { 173.5, 247.5 }, new[] { 426.0, 348.5 } };
   const double StickCut = 55;
@@ -116,6 +128,7 @@ public static class PadAsset {
     for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
       int i = y * d.Stride + x * 3; lum[y * W + x] = (byte)((raw[i] + raw[i + 1] + raw[i + 2]) / 3);
     }
+    SwapLetters();
     var log = new List<string>();
     using (var w = new BinaryWriter(File.Create(outPath))) {
       w.Write(new[] { (byte)'X', (byte)'P', (byte)'A', (byte)'D' });
@@ -133,8 +146,8 @@ public static class PadAsset {
       Region(w, Disk(Circle(342, 182, 27)), log, "Xbox");
       Region(w, Disk(Circle(514, 205, 23)), log, "Y");
       Region(w, Disk(Circle(465, 248, 23)), log, "X");
-      Region(w, Disk(Circle(562, 254, 23)), log, "A");
-      Region(w, Disk(Circle(515, 296, 23)), log, "B");
+      Region(w, Disk(Circle(BottomX, BottomY, 23)), log, "A");
+      Region(w, Disk(Circle(RightX, RightY, 23)), log, "B");
       // D-pad: the cross, split into its four arms by the diagonals through the centre.
       int dx = 258, dy = 352;
       var cross = Fill(new[] { new[] { dx, dy - 22 }, new[] { dx, dy + 22 }, new[] { dx - 22, dy }, new[] { dx + 22, dy } }, dx - 50, dy - 50, dx + 50, dy + 50);

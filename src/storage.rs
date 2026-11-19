@@ -28,6 +28,8 @@ pub struct Settings {
     pub pc_smooth_scaling: bool,
     /// Upscale the PC Play picture with NVIDIA RTX Video Super Resolution (GPU path).
     pub pc_rtx_vsr: bool,
+    /// Decode the PC Play video on the graphics card instead of the CPU.
+    pub pc_gpu_decode: bool,
     pub input_hz: u32,
     pub show_hud: bool,
     pub last_console: String,
@@ -43,6 +45,7 @@ impl Default for Settings {
             pc_high_quality: true,
             pc_smooth_scaling: true,
             pc_rtx_vsr: true,
+            pc_gpu_decode: false,
             input_hz: 120,
             show_hud: true,
             last_console: String::new(),

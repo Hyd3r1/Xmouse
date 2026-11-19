@@ -146,6 +146,36 @@ fn to_nv12(yuv: &impl YUVSource, w: usize, h: usize) -> Vec<u8> {
     out
 }
 
+/// NV12 (BT.709, limited range, as the console sends it) → RGBA.
+fn nv12_to_rgba(nv12: &[u8], w: usize, h: usize, out: &mut Vec<u8>) {
+    out.resize(w * h * 4, 255);
+    let uv = &nv12[w * h..];
+    for row in 0..h {
+        let y_row = &nv12[row * w..row * w + w];
+        let uv_row = &uv[(row / 2) * w..];
+        let px = &mut out[row * w * 4..(row + 1) * w * 4];
+        for x in 0..w {
+            let c = (y_row[x] as i32 - 16) * 298;
+            let u = uv_row[x & !1] as i32 - 128;
+            let v = uv_row[(x & !1) + 1] as i32 - 128;
+            let clamp = |n: i32| ((n + 128) >> 8).clamp(0, 255) as u8;
+            px[x * 4] = clamp(c + 459 * v);
+            px[x * 4 + 1] = clamp(c - 55 * u - 136 * v);
+            px[x * 4 + 2] = clamp(c + 541 * u);
+        }
+    }
+}
+
+/// Hand a decoded picture to the UI (one-slot mailbox: the newest wins).
+fn publish(shared: &Shared, repaint: &Repaint, frame: VideoFrame, w: usize, h: usize) {
+    if shared.video_frames.load(Ordering::Relaxed) == 0 {
+        log::info!("first decoded video frame: {w}x{h}");
+    }
+    *shared.video.lock().unwrap() = Some(frame);
+    shared.video_frames.fetch_add(1, Ordering::Relaxed);
+    repaint();
+}
+
 pub fn spawn_decoder(shared: Arc<Shared>, repaint: Repaint) -> mpsc::Sender<Packet> {
     let (tx, rx) = mpsc::channel::<Packet>();
     std::thread::Builder::new()
@@ -158,6 +188,28 @@ pub fn spawn_decoder(shared: Arc<Shared>, repaint: Repaint) -> mpsc::Sender<Pack
                     return;
                 }
             };
+            // GPU decoding (Windows, when turned on): falls back to OpenH264 if it can't start
+            // or keeps failing.
+            #[cfg(windows)]
+            let mut gpu = if shared.gpu_decode.load(Ordering::Relaxed) {
+                match crate::hwdecode::HwDecoder::new() {
+                    Ok(d) => {
+                        log::info!("video decoder: GPU (Windows H.264 decoder on D3D11)");
+                        Some(d)
+                    }
+                    Err(e) => {
+                        log::warn!("GPU video decoding unavailable, using the CPU decoder: {e:#}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            #[cfg(windows)]
+            let mut gpu_errors = 0u32;
+            // Frames fed to the GPU decoder in a row that should have given a picture but didn't.
+            #[cfg(windows)]
+            let mut gpu_silent = 0u32;
             let mut builder = Assembler::new();
             let mut errors = 0u32;
             let mut rgba: Vec<u8> = Vec::new();
@@ -180,6 +232,59 @@ pub fn spawn_decoder(shared: Arc<Shared>, repaint: Repaint) -> mpsc::Sender<Pack
                 let last = samples.len().saturating_sub(1);
                 for (i, sample) in samples.iter().enumerate() {
                     let t = Instant::now();
+                    #[cfg(windows)]
+                    if let Some(g) = gpu.as_mut() {
+                        match g.decode(sample, i == last) {
+                            Ok(picture) => {
+                                gpu_errors = 0;
+                                decoded += 1;
+                                decode_ms += t.elapsed().as_secs_f64() * 1000.0;
+                                // A decoder that takes frames but never hands one back would
+                                // leave the screen black: after ~2 s of that, use the CPU.
+                                if i == last {
+                                    if picture.is_some() {
+                                        gpu_silent = 0;
+                                    } else {
+                                        gpu_silent += 1;
+                                        if gpu_silent >= 120 {
+                                            log::warn!("GPU video decoding gives no pictures: switching to the CPU decoder");
+                                            gpu = None;
+                                            request_keyframe(&shared);
+                                            continue;
+                                        }
+                                    }
+                                }
+                                if let Some(f) = picture {
+                                    let (w, h) = (f.width, f.height);
+                                    let frame = if shared.want_nv12.load(Ordering::Relaxed) {
+                                        VideoFrame::Nv12 {
+                                            width: w,
+                                            height: h,
+                                            data: f.data,
+                                        }
+                                    } else {
+                                        nv12_to_rgba(&f.data, w, h, &mut rgba);
+                                        VideoFrame::Rgba(egui::ColorImage::from_rgba_premultiplied(
+                                            [w, h],
+                                            &rgba,
+                                        ))
+                                    };
+                                    publish(&shared, &repaint, frame, w, h);
+                                    shown += 1;
+                                }
+                            }
+                            Err(e) => {
+                                gpu_errors += 1;
+                                log::warn!("GPU decode error ({gpu_errors}): {e:#}");
+                                if gpu_errors >= 10 {
+                                    log::warn!("GPU video decoding keeps failing: switching to the CPU decoder");
+                                    gpu = None;
+                                }
+                                request_keyframe(&shared);
+                            }
+                        }
+                        continue;
+                    }
                     match decoder.decode(sample) {
                         Ok(Some(yuv)) => {
                             errors = 0;
@@ -189,9 +294,6 @@ pub fn spawn_decoder(shared: Arc<Shared>, repaint: Repaint) -> mpsc::Sender<Pack
                                 continue; // a newer frame is already here: don't draw this one
                             }
                             let (w, h) = yuv.dimensions();
-                            if shared.video_frames.load(Ordering::Relaxed) == 0 {
-                                log::info!("first decoded video frame: {w}x{h}");
-                            }
                             let frame = if shared.want_nv12.load(Ordering::Relaxed) {
                                 VideoFrame::Nv12 {
                                     width: w,
@@ -206,10 +308,8 @@ pub fn spawn_decoder(shared: Arc<Shared>, repaint: Repaint) -> mpsc::Sender<Pack
                                     &rgba,
                                 ))
                             };
-                            *shared.video.lock().unwrap() = Some(frame);
-                            shared.video_frames.fetch_add(1, Ordering::Relaxed);
+                            publish(&shared, &repaint, frame, w, h);
                             shown += 1;
-                            repaint();
                         }
                         Ok(None) => {}
                         Err(e) => {
@@ -223,8 +323,12 @@ pub fn spawn_decoder(shared: Arc<Shared>, repaint: Repaint) -> mpsc::Sender<Pack
                 }
                 if window.elapsed().as_secs() >= 5 {
                     let secs = window.elapsed().as_secs_f64();
+                    #[cfg(windows)]
+                    let engine = if gpu.is_some() { "GPU" } else { "CPU" };
+                    #[cfg(not(windows))]
+                    let engine = "CPU";
                     log::info!(
-                        "video: decoded {:.0} fps, shown {:.0} fps, decode {:.1} ms/frame, lost frames {lost_frames}",
+                        "video ({engine}): decoded {:.0} fps, shown {:.0} fps, decode {:.1} ms/frame, lost frames {lost_frames}",
                         decoded as f64 / secs,
                         shown as f64 / secs,
                         if decoded > 0 {
@@ -285,6 +389,21 @@ mod tests {
         fn v(&self) -> &[u8] {
             &self.v
         }
+    }
+
+    #[test]
+    fn nv12_to_rgba_maps_limited_range_black_white_and_red() {
+        // 2x2 picture: black, white / grey, red-ish chroma shared by all four.
+        let nv12 = [16, 235, 126, 126, 128, 128];
+        let mut out = Vec::new();
+        nv12_to_rgba(&nv12, 2, 2, &mut out);
+        assert_eq!(&out[0..4], &[0, 0, 0, 255], "Y=16 is black");
+        assert_eq!(&out[4..8], &[255, 255, 255, 255], "Y=235 is white");
+        let g = out[8];
+        assert!(g > 120 && g < 135 && out[9] == g && out[10] == g, "grey stays grey");
+        let mut red = Vec::new();
+        nv12_to_rgba(&[81, 81, 81, 81, 90, 240], 2, 2, &mut red);
+        assert!(red[0] > 200 && red[1] < 40 && red[2] < 40, "BT.709 red: {:?}", &red[0..3]);
     }
 
     #[test]

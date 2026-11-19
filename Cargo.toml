@@ -1,6 +1,6 @@
 [package]
 name = "xmouse"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 description = "Play your own Xbox with mouse and keyboard over your home network"
 license = "CC-BY-NC-SA-4.0"
@@ -31,6 +31,7 @@ cpal = "0.18.2"
 # timeBeginPeriod(1): 1 ms timer resolution for the input loop (Windows defaults to ~15.6 ms).
 windows-sys = { version = "0.61", features = ["Win32_Media"] }
 # RTX Video Super Resolution: D3D11 video processor + WGL_NV_DX_interop (src/vsr.rs).
+# GPU video decoding: Media Foundation's H.264 decoder on D3D11 (src/hwdecode.rs).
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
@@ -38,6 +39,8 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_OpenGL",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
 ] }
 glow = "0.17"
 

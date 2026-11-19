@@ -66,6 +66,8 @@ struct Session {
     /// Size of the decoded stream.
     video_size: [u32; 2],
     mods: egui::Modifiers,
+    /// When the picture first appeared (the "game ignoring your keys?" tip shows for a while).
+    tip_since: Option<Instant>,
 }
 
 struct TestPad {
@@ -105,6 +107,8 @@ pub struct XMouseApp {
     editor: Editor,
     toasts: Vec<(String, bool, Instant)>,
     autostart: bool,
+    /// --play: start the last console in the last mode as soon as consoles are known.
+    play_on_start: bool,
     ctx: egui::Context,
     frame_no: u64,
     /// Fake consoles for screenshots / UI testing (XMOUSE_DEMO=1).
@@ -126,6 +130,8 @@ pub struct XMouseApp {
 pub struct Options {
     pub autostart: bool,
     pub kiosk: bool,
+    /// Start playing right away (last console, last mode), e.g. from a desktop shortcut.
+    pub play: bool,
 }
 
 impl XMouseApp {
@@ -198,6 +204,7 @@ impl XMouseApp {
             },
             toasts: startup_toasts,
             autostart: opts.autostart,
+            play_on_start: opts.play,
             ctx: cc.egui_ctx.clone(),
             frame_no: 0,
             demo,
@@ -319,6 +326,10 @@ impl XMouseApp {
         self.save_settings();
 
         let shared = Shared::new(Mapper::new(profile));
+        shared.gpu_decode.store(
+            mode == PlayMode::Pc && self.settings.pc_gpu_decode,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let cfg = StreamConfig {
             mode,
             video_bitrate: if mode == PlayMode::Tv {
@@ -356,6 +367,7 @@ impl XMouseApp {
             vsr_tex: None,
             vsr_target: [0, 0],
             video_size: [0, 0],
+            tip_since: None,
             mods: egui::Modifiers::default(),
         });
     }
@@ -854,6 +866,18 @@ impl XMouseApp {
                     self.save_settings();
                     return;
                 }
+            }
+        }
+        // --play: one-click start (e.g. a desktop shortcut) on the last console, last mode.
+        if self.play_on_start && consoles.is_some() {
+            self.play_on_start = false;
+            if let Some(c) = list
+                .iter()
+                .find(|c| c.server_id == self.settings.last_console)
+            {
+                let mode = self.settings.last_mode;
+                self.start_session(c.clone(), mode);
+                return;
             }
         }
 
@@ -2404,6 +2428,7 @@ impl XMouseApp {
             pc_high_quality,
             pc_smooth_scaling,
             pc_rtx_vsr,
+            pc_gpu_decode,
             input_hz,
             show_hud,
             ..
@@ -2520,6 +2545,23 @@ impl XMouseApp {
                                     changed |= ui.selectable_value(pc_rtx_vsr, true, "On").changed();
                                     changed |=
                                         ui.selectable_value(pc_rtx_vsr, false, "Off").changed();
+                                });
+                        },
+                    );
+                    control_row(
+                        ui,
+                        false,
+                        "GPU video decoding",
+                        "Decode the stream on the graphics card: less input lag and less CPU. Best on NVIDIA RTX with RTX Video upscaling on. Falls back to the CPU if it can't start.",
+                        |ui| {
+                            egui::ComboBox::from_id_salt("pcgpudec")
+                                .width(150.0)
+                                .selected_text(if *pc_gpu_decode { "On" } else { "Off" })
+                                .show_ui(ui, |ui| {
+                                    changed |=
+                                        ui.selectable_value(pc_gpu_decode, true, "On").changed();
+                                    changed |=
+                                        ui.selectable_value(pc_gpu_decode, false, "Off").changed();
                                 });
                         },
                     );
@@ -3013,6 +3055,7 @@ fn player_window(
         if s.show_hud && connected {
             controls_legend(&pctx, layer, legend, picture);
         }
+        game_tip(&pctx, s, connected, picture);
         finder_overlay(&pctx, s);
         pctx.request_repaint_after(Duration::from_millis(16));
     });
@@ -3199,6 +3242,67 @@ fn controls_legend(
                         RichText::new("F7 hides")
                             .font(mono(10.0))
                             .color(Color32::from_white_alpha(70)),
+                    );
+                });
+        });
+}
+
+/// How long the "game ignoring your keys?" tip stays up after the picture appears.
+const TIP_SECS: f32 = 10.0;
+
+/// A short tip at the top of the picture for the first seconds of a session: a game started
+/// with another controller ignores XMouse's until you hand it over from the Xbox guide.
+fn game_tip(ctx: &egui::Context, s: &mut Session, connected: bool, picture: egui::Rect) {
+    if !connected || s.shared.video_frames.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return;
+    }
+    if s.tip_since.is_none() {
+        // A soft notification chime as the tip appears.
+        crate::chime::play_notification();
+    }
+    let age = s.tip_since.get_or_insert_with(Instant::now).elapsed().as_secs_f32();
+    if age > TIP_SECS {
+        return;
+    }
+    // Fade in quickly, out over the last 1.5 s.
+    let fade = (age / 0.4).min((TIP_SECS - age) / 1.5).clamp(0.0, 1.0);
+    // Name the keys this profile uses for the Xbox button and A.
+    let key_for = |action: Action| -> Option<String> {
+        let m = s.shared.mapper.lock().unwrap();
+        m.profile()
+            .layers
+            .first()
+            .and_then(|l| l.bindings.iter().find(|b| b.action == action))
+            .map(|b| input_label(&b.input))
+    };
+    let xbox = key_for(Action::Nexus)
+        .map(|k| format!("{k} (Xbox button)"))
+        .unwrap_or_else(|| "the Xbox button".into());
+    let a = key_for(Action::A)
+        .map(|k| format!("{k} (A)"))
+        .unwrap_or_else(|| "A".into());
+    let white = |alpha: f32| Color32::from_white_alpha((alpha * fade * 255.0) as u8);
+    egui::Area::new(egui::Id::unique("game-tip"))
+        .pivot(egui::Align2::CENTER_TOP)
+        .fixed_pos(egui::pos2(picture.center().x, picture.top() + 24.0))
+        .interactable(false)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(Color32::from_black_alpha((170.0 * fade) as u8))
+                .corner_radius(CornerRadius::same(12))
+                .inner_margin(Margin::symmetric(18, 12))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new("Game ignoring your keys?")
+                            .font(bold(16.0))
+                            .color(white(0.95)),
+                    );
+                    ui.label(
+                        RichText::new(format!(
+                            "Press {xbox}, pick the game's tile and press {a} to play it with XMouse."
+                        ))
+                        .font(body(14.5))
+                        .color(white(0.8)),
                     );
                 });
         });

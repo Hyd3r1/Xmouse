@@ -76,6 +76,8 @@ pub struct Shared {
     pub video_packets: AtomicU64,
     /// The UI's GPU upscaler is running: hand frames over as NV12 instead of RGBA.
     pub want_nv12: AtomicBool,
+    /// Decode the video on the graphics card (set before the stream starts).
+    pub gpu_decode: AtomicBool,
     pub video: Mutex<Option<VideoFrame>>,
     acks: Mutex<VecDeque<FrameMeta>>,
     keyframe_wanted: AtomicBool,
@@ -101,6 +103,7 @@ impl Shared {
             video_frames: AtomicU64::new(0),
             video_packets: AtomicU64::new(0),
             want_nv12: AtomicBool::new(false),
+            gpu_decode: AtomicBool::new(false),
             video: Mutex::new(None),
             acks: Mutex::new(VecDeque::new()),
             keyframe_wanted: AtomicBool::new(false),

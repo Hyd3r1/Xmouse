@@ -2,12 +2,15 @@
 
 pub mod audio;
 pub mod auth;
+pub mod chime;
 pub mod mapper;
 pub mod packet;
 pub mod profile;
 pub mod storage;
 pub mod stream;
 pub mod video;
+#[cfg(windows)]
+pub mod hwdecode;
 #[cfg(windows)]
 pub mod vsr;
 pub mod xhome;

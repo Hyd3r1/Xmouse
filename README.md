@@ -15,6 +15,7 @@ One small Windows app. Sign in, press Play, and your console's picture and sound
 - **Your console, on your PC.** The game streams over your home network in up to 1080p at 60 fps, with sound, in its own window. Go fullscreen with F11.
 - **Mouse and keyboard as a controller.** Every key and mouse button can be any controller button, stick direction or trigger. Mouse movement becomes a smooth, tunable right stick.
 - **Sharper picture on NVIDIA RTX.** RTX Video Super Resolution upscales the stream to your monitor, so 1080p looks crisp on a 1440p or 4K screen.
+- **GPU video decoding.** Turn it on and your graphics card decodes the stream in under 2 ms a frame instead of the CPU, for less input lag. It falls back to the CPU by itself if it can't run.
 - **Ready-made game profiles.** GTA VI, GTA V, Red Dead Redemption 2, a standard shooter layout, third-person action games and the Xbox menus. Each one is fully editable.
 - **Layers.** One key can switch the whole layout: in GTA, `F` gets you into a car and your keys turn into driving controls, then `F` again gets you back out.
 - **Built to feel tight.** Input goes out at 120 Hz. Video is decoded the moment the last packet of a frame lands, and the app never builds up a backlog.
@@ -85,7 +86,7 @@ XMouse works well on an **Xbox Series S** and great on an **Xbox Series X**: the
 | Right / left click | Aim / shoot | Mouse back / forward | Drive-by aim / handbrake |
 | Mouse back / forward | Weapon wheel / cover | `R` | Cinematic camera |
 | `R` | Reload / melee | `C` | Look behind |
-| `Ctrl` | Stealth | `M` | Map |
+| `Ctrl` | Run (holds the left stick in) | `M` | Map |
 | `C` | Look behind | Arrow keys | D-pad (radio, headlights) |
 | `M` | Map | | |
 | Arrow keys | D-pad | | |
@@ -93,7 +94,9 @@ XMouse works well on an **Xbox Series S** and great on an **Xbox Series X**: the
 
 ## Tips
 
-- **The game ignores your keys but the Xbox menus react?** The game is still listening to the controller that started it. Press `Home` (the Xbox button), select the game's tile and press `Shift` (A) to jump back in with XMouse. Or start the game from XMouse in the first place.
+- **The game ignores your keys but the Xbox menus react?** The game is still listening to the controller that started it. Press `Home` (the Xbox button), select the game's tile and press `Shift` (A) to jump back in with XMouse. Or start the game from XMouse in the first place. XMouse reminds you of this with a short tip and a chime when the picture appears.
+- **Less input lag on NVIDIA RTX:** turn on *GPU video decoding* (and *RTX Video upscaling*) under *More → Picture and connection*.
+- **One-click play:** start XMouse with `--play` (for example from a desktop shortcut) and it connects straight to your last console in your last mode.
 - **No sharper picture on RTX?** Turn on *Super Resolution* under *Graphics → Video* in the NVIDIA app, and check that *RTX Video upscaling* is *On* under *More → Picture and connection* in XMouse.
 - **Picture stutters?** Plug the PC or the Xbox into the router with a cable, and close other heavy downloads on the network.
 

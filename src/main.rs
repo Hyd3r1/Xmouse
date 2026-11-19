@@ -21,6 +21,7 @@ fn main() -> eframe::Result {
     let opts = Options {
         autostart: args.iter().any(|a| a == "--autostart"),
         kiosk: args.iter().any(|a| a == "--kiosk"),
+        play: args.iter().any(|a| a == "--play"),
     };
 
     let native = eframe::NativeOptions {

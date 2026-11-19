@@ -448,7 +448,8 @@ fn gta6_on_foot() -> Vec<Binding> {
         b("Mouse3", Action::LeftShoulder).named("Weapon wheel (LB)"),
         b("Mouse4", Action::RightShoulder).named("Cover (RB)"),
         b("R", Action::B).named("Reload / melee"),
-        bm("Ctrl", Action::LeftThumb, BindMode::Tap).named("Stealth"),
+        // Held: the left stick stays pressed in (L3) while Ctrl is down, for running.
+        b("Ctrl", Action::LeftThumb).named("Run (L3)"),
         b("C", Action::RightThumb).named("Look behind"),
         b("M", Action::View).named("Map"),
         b("Up", Action::DPadUp).named("D-pad up"),
@@ -518,7 +519,7 @@ pub fn builtin_profiles() -> Vec<Profile> {
         id: "gta-vi".into(),
         name: "GTA VI".into(),
         game: "Grand Theft Auto VI".into(),
-        notes: "Shift = A, Space = X, M = View (map), arrow keys = D-pad, mouse back button (mouse 4) = LB, forward button (mouse 5) = RB. One key per button. F enters/exits vehicles and switches keys. Use the deadzone finder (F6) in game.".into(),
+        notes: "Shift = A, Space = X, Ctrl = run (holds the left stick in), M = View (map), arrow keys = D-pad, mouse back button (mouse 4) = LB, forward button (mouse 5) = RB. One key per button. F enters/exits vehicles and switches keys. Use the deadzone finder (F6) in game.".into(),
         layers: vec![
             Layer { name: "On foot".into(), bindings: gta6_on_foot() },
             Layer { name: "Vehicle".into(), bindings: gta6_vehicle() },
@@ -766,6 +767,9 @@ mod tests {
         assert_eq!(find("Mouse3"), Action::LeftShoulder);
         assert_eq!(find("Mouse4"), Action::RightShoulder);
         assert_eq!(find("M"), Action::View);
+        // Ctrl holds the left stick in (L3) for running, for as long as it's held.
+        let ctrl = foot.iter().find(|bnd| bnd.input == "Ctrl").unwrap();
+        assert_eq!((ctrl.action, ctrl.mode), (Action::LeftThumb, BindMode::Hold));
         assert!(foot.iter().all(|bnd| bnd.input != "V"));
         for layer in &p.layers {
             let key = |k: &str| {

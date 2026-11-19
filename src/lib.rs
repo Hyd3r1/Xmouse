@@ -10,6 +10,9 @@ pub mod profile;
 pub mod ps;
 pub mod storage;
 pub mod stream;
+pub mod glpipe;
+pub mod pacing;
+pub mod testvideo;
 pub mod video;
 #[cfg(windows)]
 pub mod hwdecode;

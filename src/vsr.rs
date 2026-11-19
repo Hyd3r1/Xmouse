@@ -266,6 +266,12 @@ impl Vsr {
         ))
     }
 
+    /// The GL texture `process` renders into, for passes that run after the upscaler
+    /// (sharpening, colour). It is readable from GL whenever `process` has returned.
+    pub fn gl_texture(&self) -> Option<glow::Texture> {
+        self.output.as_ref().filter(|o| o.locked).map(|o| o.gl)
+    }
+
     /// (Re)create the NV12 upload textures for `w`×`h` with these bind flags. True if recreated.
     fn ensure_input(&mut self, w: u32, h: u32, bind: u32) -> Result<bool> {
         if self

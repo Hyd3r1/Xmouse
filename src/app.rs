@@ -9,6 +9,10 @@ use egui::{
 };
 
 use crate::auth::{Auth, DeviceCode};
+use crate::glpipe::{Look, Pipeline, Source};
+use crate::pacing::{
+    nominal_fps, Arrival, Cadence, DupDetector, Kind, Pacer, Show, Signature, Skip, StreamStats,
+};
 use crate::mapper::{suggest_sensitivity, Mapper, PadFrame};
 use crate::padview::pad_view;
 use crate::profile::{
@@ -207,10 +211,10 @@ struct Session {
     captured: bool,
     show_hud: bool,
     texture: Option<TextureHandle>,
-    last_video: u64,
-    /// RTX Video Super Resolution output: the egui texture and the part of it holding the picture.
+    /// The picture when it comes from the GPU (RTX Video Super Resolution or our own
+    /// passes): the egui texture and the part of it holding the picture.
     vsr_tex: Option<(egui::TextureId, egui::Vec2)>,
-    /// Picture size in physical pixels in the player window (what VSR scales to).
+    /// Picture size in physical pixels in the player window (what the GPU scales to).
     vsr_target: [u32; 2],
     /// Size of the decoded stream.
     video_size: [u32; 2],
@@ -219,6 +223,133 @@ struct Session {
     tip_since: Option<Instant>,
     /// The overlay's key list for a layer: (layer it was built for, its rows).
     legend: (Option<String>, Arc<Vec<(String, String)>>),
+    /// Frame timing and the state of the picture pipeline for this session.
+    pic: PictureState,
+}
+
+/// Which way the PC Play picture takes to the screen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Route {
+    /// As it always was: RTX Video upscaling, or an egui texture scaled by egui.
+    Plain,
+    /// RTX Video upscaling, then sharpening / colour in our own passes.
+    VsrPost,
+    /// Everything in our own passes (`glpipe`).
+    Pipeline,
+}
+
+#[derive(Default)]
+struct PictureState {
+    /// Zero of the frame clock (arrival times are seconds since then).
+    epoch: Option<Instant>,
+    detector: DupDetector,
+    cadence: Cadence,
+    pacer: Pacer,
+    stats: StreamStats,
+    /// (route, Smooth motion on) the state below belongs to; a change starts it over.
+    mode: Option<(Route, bool)>,
+    /// The in-between frame is on screen right now (else the real one).
+    showing_mid: bool,
+    /// The longest a real frame went on screen after its planned time, since the last log
+    /// line (seconds).
+    late: f64,
+    /// RTX Video's last output for the passes after it: (UV size, pixel size), and a
+    /// counter that changes with every new one.
+    vsr_raw: Option<(egui::Vec2, [u32; 2])>,
+    vsr_version: u64,
+    /// The player window's centre in screen pixels (to find the display it is on).
+    player_center: Option<[i32; 2]>,
+    /// Refresh rate of that display, and when it was last looked up.
+    display: Option<(f64, Instant)>,
+    /// Test runs (XMOUSE_PICTURE_DUMP): pictures written so far, and the last one's version.
+    dumped: (u32, u64),
+}
+
+/// The picture settings as the pipeline wants them.
+fn picture_look(s: &Settings) -> Look {
+    Look {
+        cleanup: s
+            .pc_cleanup
+            .then_some(if s.pc_cleanup_strong { 1.0 } else { 0.0 }),
+        sharpen: s.pc_sharpen.then_some(s.pc_sharpen_amount),
+        colour: s
+            .pc_colour
+            .then_some([s.pc_vibrance, s.pc_contrast, s.pc_brightness]),
+        edge_upscale: s.pc_sharp_upscale,
+        smooth: s.pc_smooth_scaling,
+    }
+}
+
+/// Refresh rate of the display the player window is on (the main one if unknown).
+fn display_hz(center: Option<[i32; 2]>) -> f64 {
+    // For testing the 60 Hz rules on a faster screen.
+    static FORCED: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    if let Some(hz) = FORCED.get_or_init(|| {
+        std::env::var("XMOUSE_DISPLAY_HZ")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    }) {
+        return *hz;
+    }
+    #[cfg(windows)]
+    {
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::Graphics::Gdi::{
+            EnumDisplaySettingsW, GetMonitorInfoW, MonitorFromPoint, DEVMODEW,
+            ENUM_CURRENT_SETTINGS, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
+        };
+        unsafe {
+            let mut info = MONITORINFOEXW::default();
+            info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+            let mut found = false;
+            if let Some([x, y]) = center {
+                let monitor = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+                found = GetMonitorInfoW(monitor, &mut info as *mut _ as *mut MONITORINFO).as_bool();
+            }
+            let device = if found {
+                PCWSTR(info.szDevice.as_ptr())
+            } else {
+                PCWSTR::null()
+            };
+            let mut mode = DEVMODEW {
+                dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+                ..Default::default()
+            };
+            if EnumDisplaySettingsW(device, ENUM_CURRENT_SETTINGS, &mut mode).as_bool()
+                && mode.dmDisplayFrequency > 1
+            {
+                return mode.dmDisplayFrequency as f64;
+            }
+        }
+    }
+    let _ = center;
+    60.0
+}
+
+/// Test runs: write an RGBA picture (rows top first) as a 24-bit BMP.
+fn write_bmp(path: &std::path::Path, w: u32, h: u32, rgba: &[u8]) {
+    let row = (w as usize * 3).div_ceil(4) * 4;
+    let mut out = Vec::with_capacity(54 + row * h as usize);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&((54 + row * h as usize) as u32).to_le_bytes());
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&54u32.to_le_bytes());
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&(w as i32).to_le_bytes());
+    // (negative height: rows are stored top first)
+    out.extend_from_slice(&(-(h as i32)).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&24u16.to_le_bytes());
+    out.extend_from_slice(&[0; 24]);
+    for line in rgba.chunks_exact(w as usize * 4) {
+        let start = out.len();
+        for px in line.chunks_exact(4) {
+            out.extend_from_slice(&[px[2], px[1], px[0]]);
+        }
+        out.resize(start + row, 0);
+    }
+    let _ = std::fs::write(path, out);
 }
 
 struct TestPad {
@@ -283,6 +414,11 @@ pub struct XMouseApp {
     vsr_guard_armed: bool,
     /// Output size the guard last saw (a change means a new processor setup).
     vsr_guard_target: [u32; 2],
+    /// Our own picture passes (clean-up, in-between frames, upscaling, sharpening, colour),
+    /// created on first use.
+    pipe: Option<Pipeline>,
+    /// They failed once on this graphics driver: show the plain picture for this run.
+    pipe_failed: bool,
 }
 
 pub struct Options {
@@ -377,6 +513,8 @@ impl XMouseApp {
             vsr_watch: (0, 0),
             vsr_guard_armed: false,
             vsr_guard_target: [0, 0],
+            pipe: None,
+            pipe_failed: false,
         };
         app.apply_platform_names();
         app
@@ -875,14 +1013,18 @@ impl XMouseApp {
             captured: false,
             show_hud: self.settings.show_hud,
             texture: None,
-            last_video: 0,
             vsr_tex: None,
             vsr_target: [0, 0],
             video_size: [0, 0],
             tip_since: None,
             legend: (None, Arc::new(Vec::new())),
             mods: egui::Modifiers::default(),
+            pic: PictureState::default(),
         });
+        // Nothing of the last session's picture may show up in this one.
+        if let Some(p) = self.pipe.as_mut() {
+            p.reset_history();
+        }
     }
 
     fn end_session(&mut self, ctx: &egui::Context) {
@@ -3332,6 +3474,16 @@ impl XMouseApp {
             pc_smooth_scaling,
             pc_rtx_vsr,
             pc_gpu_decode,
+            pc_cleanup,
+            pc_cleanup_strong,
+            pc_sharpen,
+            pc_sharpen_amount,
+            pc_colour,
+            pc_vibrance,
+            pc_contrast,
+            pc_brightness,
+            pc_smooth_motion,
+            pc_sharp_upscale,
             input_hz,
             show_hud,
             ..
@@ -3381,6 +3533,97 @@ impl XMouseApp {
                         },
                     );
                 });
+                section(ui, "PC Play picture");
+                group(ui, |ui| {
+                    control_row(
+                        ui,
+                        true,
+                        "Clean up compression",
+                        "Softens the blocks, bands and noise of the video stream. Text and edges stay sharp.",
+                        |ui| {
+                            changed |= switch(ui, pc_cleanup).changed();
+                        },
+                    );
+                    if *pc_cleanup {
+                        control_row(ui, false, "Clean-up strength", "", |ui| {
+                            egui::ComboBox::from_id_salt("pcclean")
+                                .width(150.0)
+                                .selected_text(if *pc_cleanup_strong { "Strong" } else { "Light" })
+                                .show_ui(ui, |ui| {
+                                    changed |= ui
+                                        .selectable_value(pc_cleanup_strong, false, "Light")
+                                        .changed();
+                                    changed |= ui
+                                        .selectable_value(pc_cleanup_strong, true, "Strong")
+                                        .changed();
+                                });
+                        });
+                    }
+                    control_row(
+                        ui,
+                        false,
+                        "Sharpen",
+                        "Brings out fine detail without halos around edges.",
+                        |ui| {
+                            changed |= switch(ui, pc_sharpen).changed();
+                        },
+                    );
+                    if *pc_sharpen {
+                        control_row(ui, false, "Sharpness", "", |ui| {
+                            changed |= slider_f32(ui, pc_sharpen_amount, 0.0..=1.0, |v| {
+                                format!("{:.0}%", v * 100.0)
+                            });
+                        });
+                    }
+                    control_row(
+                        ui,
+                        false,
+                        "Colour",
+                        "Vibrance lifts dull colours and leaves skin tones alone.",
+                        |ui| {
+                            changed |= switch(ui, pc_colour).changed();
+                        },
+                    );
+                    if *pc_colour {
+                        control_row(ui, false, "Vibrance", "", |ui| {
+                            changed |= slider_f32(ui, pc_vibrance, 0.0..=1.0, |v| {
+                                format!("{:.0}%", v * 100.0)
+                            });
+                        });
+                        control_row(ui, false, "Contrast", "", |ui| {
+                            changed |= slider_f32(ui, pc_contrast, -0.3..=0.3, |v| {
+                                format!("{:+.0}%", v * 100.0)
+                            });
+                        });
+                        control_row(ui, false, "Brightness", "", |ui| {
+                            changed |= slider_f32(ui, pc_brightness, -0.2..=0.2, |v| {
+                                format!("{:+.0}%", v * 100.0)
+                            });
+                        });
+                    }
+                    control_row(
+                        ui,
+                        false,
+                        "Smooth motion",
+                        "Adds in-between frames so 30 fps games look like 60. Adds about one frame of input lag (≈17 ms in a 30 fps game, ≈8 ms at 60 fps). A 60 fps game needs a 120 Hz screen.",
+                        |ui| {
+                            changed |= switch(ui, pc_smooth_motion).changed();
+                        },
+                    );
+                    control_row(
+                        ui,
+                        false,
+                        "Sharp upscaling",
+                        "Enlarges the picture with crisp edges on any graphics card. Used when RTX Video upscaling is off.",
+                        |ui| {
+                            changed |= switch(ui, pc_sharp_upscale).changed();
+                        },
+                    );
+                });
+                hint(
+                    ui,
+                    "Clean up compression and Smooth motion use XMouse's own upscaling in place of RTX Video. Sharpen and Colour work with both.",
+                );
             } else {
                 section(ui, "PC Play");
                 group(ui, |ui| {
@@ -3536,6 +3779,8 @@ impl XMouseApp {
         let input_hz = self.settings.input_hz;
         let smooth = self.settings.pc_smooth_scaling;
         let vsr_wanted = self.settings.pc_rtx_vsr;
+        let look = picture_look(&self.settings);
+        let smooth_motion = self.settings.pc_smooth_motion;
         let s = self.session.as_mut().unwrap();
         let status = s.shared.status();
         let connected = status.phase == Phase::Connected;
@@ -3552,11 +3797,36 @@ impl XMouseApp {
             save_profile = session_input(s, ctx);
         }
 
-        // Video (PC Play). With RTX Video upscaling on, the decoder hands over NV12 and the GPU
-        // scales it to the player window's pixel size; otherwise RGBA + egui scaling.
+        // Video (PC Play). Three ways to the screen (see `Route`): as it always was (RTX Video
+        // upscales NV12 frames on the GPU, or egui scales RGBA frames), RTX Video followed by
+        // our own sharpening / colour passes, or everything in our own passes.
+        let pc = s.mode == PlayMode::Pc;
+        let gl = frame.gl().cloned();
+        let post = look.sharpen.is_some() || look.colour.is_some();
+        // Clean-up and in-between frames work on the stream's own pixels, before any scaling:
+        // with those on, the picture goes through our passes and RTX Video is left out.
+        let before_scaling = look.cleanup.is_some() || smooth_motion;
+        let mut pipe_error: Option<String> = None;
+        let mut motion_error = false;
+        if pc
+            && self.pipe.is_none()
+            && !self.pipe_failed
+            && (before_scaling || post || look.edge_upscale)
+        {
+            if let Some(gl) = gl.as_ref() {
+                match Pipeline::new(gl) {
+                    Ok(p) => self.pipe = Some(p),
+                    Err(e) => {
+                        self.pipe_failed = true;
+                        pipe_error = Some(format!("{e:#}"));
+                    }
+                }
+            }
+        }
+        let pipe_ok = pc && self.pipe.is_some() && gl.is_some();
         #[cfg(windows)]
         let gpu = {
-            let wanted = vsr_wanted && s.mode == PlayMode::Pc && !self.vsr_failed;
+            let wanted = vsr_wanted && pc && !self.vsr_failed && !(before_scaling && pipe_ok);
             if wanted && self.vsr.is_none() {
                 match crate::vsr::Vsr::new() {
                     Ok(v) => self.vsr = Some(v),
@@ -3570,21 +3840,170 @@ impl XMouseApp {
         };
         #[cfg(not(windows))]
         let gpu = false;
-        s.shared
-            .want_nv12
-            .store(gpu, std::sync::atomic::Ordering::Relaxed);
-        if !gpu {
-            s.vsr_tex = None;
+        let route = if pipe_ok && before_scaling {
+            Route::Pipeline
+        } else if gpu {
+            if pipe_ok && post {
+                Route::VsrPost
+            } else {
+                Route::Plain
+            }
+        } else if pipe_ok && (post || look.edge_upscale) {
+            Route::Pipeline
+        } else {
+            Route::Plain
+        };
+        s.shared.want_nv12.store(
+            gpu || route == Route::Pipeline,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        if s.pic.mode != Some((route, smooth_motion)) {
+            // A switch was flipped (or the session just started): in-between frames start
+            // over. The last picture stays on screen until the new route delivers one.
+            s.pic.mode = Some((route, smooth_motion));
+            s.pic.pacer.reset();
+            s.pic.showing_mid = false;
+            s.pic.vsr_raw = None;
+            if let Some(p) = self.pipe.as_mut() {
+                p.reset_history();
+            }
+            log::info!("picture: {route:?} route, smooth motion {smooth_motion}");
         }
         let frames = s
             .shared
             .video_frames
             .load(std::sync::atomic::Ordering::Relaxed);
-        if s.mode == PlayMode::Pc && frames != s.last_video {
-            let next = s.shared.video.lock().unwrap().take();
-            match next {
+
+        // Every frame counts for the timing (is it a repeat? how fast does the game really
+        // run?); only the newest is shown.
+        let now_i = Instant::now();
+        let epoch = *s.pic.epoch.get_or_insert(now_i);
+        let secs = |t: Instant| t.saturating_duration_since(epoch).as_secs_f64();
+        let now = secs(now_i);
+        let mut batch = if pc {
+            s.shared.video.drain()
+        } else {
+            Vec::new()
+        };
+        let mut new_pictures: Vec<(f64, Kind)> = Vec::new();
+        for f in &batch {
+            let sig = match &f.frame {
+                VideoFrame::Rgba(img) => {
+                    Signature::from_rgba(&img.pixels, img.size[0], img.size[1])
+                }
+                VideoFrame::Nv12 {
+                    width,
+                    height,
+                    data,
+                } => Signature::from_luma(data, *width, *height),
+            };
+            let kind = s.pic.detector.classify(sig);
+            let at = secs(f.at);
+            s.pic.cadence.on_frame(at, kind != Kind::Duplicate);
+            s.pic.stats.on_frame(at, kind);
+            if kind != Kind::Duplicate {
+                new_pictures.push((at, kind));
+            }
+        }
+        let newest = batch.pop();
+        if let Some(f) = &newest {
+            s.video_size = match &f.frame {
+                VideoFrame::Rgba(img) => [img.size[0] as u32, img.size[1] as u32],
+                VideoFrame::Nv12 { width, height, .. } => [*width as u32, *height as u32],
+            };
+        }
+
+        if route == Route::Pipeline {
+            if let (Some(p), Some(gl)) = (self.pipe.as_mut(), gl.as_ref()) {
+                let hz = match s.pic.display {
+                    Some((hz, at)) if at.elapsed() < Duration::from_secs(2) => hz,
+                    _ => {
+                        let hz = display_hz(s.pic.player_center);
+                        s.pic.display = Some((hz, now_i));
+                        hz
+                    }
+                };
+                let target = if s.vsr_target[0] > 0 {
+                    s.vsr_target
+                } else {
+                    s.video_size
+                };
+                let pic = &mut s.pic;
+                let shown = (|| -> anyhow::Result<Option<(egui::TextureId, egui::Vec2)>> {
+                    if let Some(f) = &newest {
+                        if !smooth_motion {
+                            p.submit(gl, &f.frame, look.cleanup, false, false)?;
+                        } else if let Some(&(at, kind)) = new_pictures.last() {
+                            p.submit(gl, &f.frame, look.cleanup, true, true)?;
+                            let mut show = pic.pacer.on_unique(Arrival {
+                                at,
+                                now,
+                                interval: pic.cadence.content_interval(),
+                                display_hz: hz,
+                                cut: kind == Kind::Cut,
+                                // (Two new pictures at once: the UI was late and the one
+                                // in between was never uploaded.)
+                                have_prev: new_pictures.len() == 1
+                                    && kind != Kind::First
+                                    && p.has_prev(),
+                            });
+                            if matches!(show, Show::Mid { .. }) {
+                                if let Err(e) = p.interpolate(gl) {
+                                    log::warn!("Smooth motion can't run on this graphics driver: {e:#}");
+                                    motion_error = true;
+                                    pic.pacer.reset();
+                                    show = Show::Real(Skip::NoHistory);
+                                }
+                            }
+                            pic.stats.on_show(show);
+                            pic.showing_mid = matches!(show, Show::Mid { .. });
+                        } else {
+                            // A repeat. Its pixels are still taken (a "repeat" may hide a
+                            // small change), and it is the stream's own tick for a real
+                            // frame that waits behind an in-between frame.
+                            p.submit(gl, &f.frame, look.cleanup, false, true)?;
+                            let due = pic.pacer.pending();
+                            if pic.pacer.on_duplicate(secs(f.at)) {
+                                pic.showing_mid = false;
+                                pic.late = pic.late.max(now - due.unwrap_or(now));
+                            }
+                        }
+                    }
+                    let due = pic.pacer.pending();
+                    if pic.pacer.poll(now) {
+                        pic.showing_mid = false;
+                        pic.late = pic.late.max(now - due.unwrap_or(now));
+                    }
+                    if !p.has_picture() {
+                        return Ok(None);
+                    }
+                    let src = if pic.showing_mid {
+                        Source::Mid
+                    } else {
+                        Source::Current
+                    };
+                    Ok(Some(p.present(gl, frame, src, target, look)?))
+                })();
+                match shown {
+                    Ok(Some(t)) => {
+                        s.vsr_tex = Some(t);
+                        dump_picture(p, gl, &mut s.pic, frames);
+                    }
+                    Ok(None) => {}
+                    Err(e) => pipe_error = Some(format!("{e:#}")),
+                }
+                // No repeat may come to show the waiting real frame (60 fps game): wake up
+                // for it.
+                if let Some(due) = s.pic.pacer.pending() {
+                    ctx.request_repaint_after(Duration::from_secs_f64((due - now).max(0.0)));
+                }
+            }
+        } else {
+            match newest.map(|f| f.frame) {
                 Some(VideoFrame::Rgba(img)) => {
-                    s.video_size = [img.size[0] as u32, img.size[1] as u32];
+                    if !gpu {
+                        s.vsr_tex = None;
+                    }
                     let opts = if smooth {
                         TextureOptions::LINEAR
                     } else {
@@ -3600,12 +4019,10 @@ impl XMouseApp {
                     height,
                     data,
                 }) => {
-                    s.video_size = [width as u32, height as u32];
                     #[cfg(windows)]
                     {
-                        let gl = frame.gl().cloned();
                         let mut failed = None;
-                        if let (Some(v), Some(gl)) = (self.vsr.as_mut(), gl) {
+                        if let (Some(v), Some(gl)) = (self.vsr.as_mut(), gl.as_ref()) {
                             let [tw, th] = if s.vsr_target[0] > 0 {
                                 s.vsr_target
                             } else {
@@ -3622,10 +4039,16 @@ impl XMouseApp {
                                     self.vsr_guard_armed = true;
                                 }
                             }
-                            match v.process(&gl, frame, width as u32, height as u32, &data, tw, th)
+                            match v.process(gl, frame, width as u32, height as u32, &data, tw, th)
                             {
                                 Ok(t) => {
-                                    s.vsr_tex = Some(t);
+                                    if route == Route::VsrPost {
+                                        // Sharpening / colour come after it, below.
+                                        s.pic.vsr_raw = Some((t.1, [tw, th]));
+                                        s.pic.vsr_version += 1;
+                                    } else {
+                                        s.vsr_tex = Some(t);
+                                    }
                                     if v.generation != self.vsr_watch.0 {
                                         self.vsr_watch = (v.generation, 0);
                                     }
@@ -3653,7 +4076,79 @@ impl XMouseApp {
                 }
                 None => {}
             }
-            s.last_video = frames;
+        }
+        // RTX Video's picture, sharpened / graded by our passes.
+        #[cfg(windows)]
+        if route == Route::VsrPost {
+            if let (Some(p), Some(gl), Some((uv, size))) =
+                (self.pipe.as_mut(), gl.as_ref(), s.pic.vsr_raw)
+            {
+                if let Some(texture) = self.vsr.as_ref().and_then(|v| v.gl_texture()) {
+                    let src = Source::External {
+                        texture,
+                        uv: [uv.x, uv.y],
+                        version: s.pic.vsr_version,
+                    };
+                    match p.present(gl, frame, src, size, look) {
+                        Ok(t) => {
+                            s.vsr_tex = Some(t);
+                            dump_picture(p, gl, &mut s.pic, frames);
+                        }
+                        Err(e) => pipe_error = Some(format!("{e:#}")),
+                    }
+                }
+            }
+        }
+        if let Some(e) = &pipe_error {
+            log::warn!("picture processing failed, showing the plain picture: {e}");
+            self.pipe_failed = true;
+            if let (Some(p), Some(gl)) = (self.pipe.take(), gl.as_ref()) {
+                p.destroy(gl);
+            }
+            s.vsr_tex = None;
+            s.pic.vsr_raw = None;
+        }
+        // What the stream really carries, every five seconds: a 60 fps stream of a 30 fps
+        // game shows up here as half repeats.
+        if let Some((stream, unique)) = s.pic.stats.report(now, 5.0) {
+            let repeats = if stream > 0.0 {
+                (1.0 - unique / stream).max(0.0) * 100.0
+            } else {
+                0.0
+            };
+            let mut line = format!(
+                "picture: stream {stream:.1} fps, {unique:.1} new pictures a second ({repeats:.0}% repeats): the game runs at about {} fps",
+                nominal_fps(unique)
+            );
+            if smooth_motion && route == Route::Pipeline {
+                line += &format!(
+                    " | smooth motion: {} in-between frames",
+                    s.pic.stats.generated
+                );
+                if let Some((why, n)) = s.pic.stats.main_skip() {
+                    line += &format!(", {n} pictures shown without one ({why:?})");
+                }
+                if s.pic.stats.generated > 0 {
+                    line += &format!(
+                        ", real frames at most {:.1} ms behind schedule",
+                        s.pic.late * 1000.0
+                    );
+                }
+                if let Some((hz, _)) = s.pic.display {
+                    line += &format!(", display {hz:.0} Hz");
+                }
+                s.pic.late = 0.0;
+            }
+            if route != Route::Plain {
+                if let Some(p) = &self.pipe {
+                    let [clean, motion, output] = p.gpu_ms();
+                    line += &format!(
+                        " | GPU: frame {clean:.2} ms, motion {motion:.2} ms, output {output:.2} ms"
+                    );
+                }
+            }
+            log::info!("{line}");
+            s.pic.stats.clear_counts();
         }
 
         let (frame, layer, pname, legend) = {
@@ -3883,10 +4378,56 @@ impl XMouseApp {
                 Err(e) => self.toast(format!("Could not save: {e}"), true),
             }
         }
+        if pipe_error.is_some() {
+            self.toast(
+                "The picture settings can't run on this graphics card. Showing the plain picture.",
+                true,
+            );
+        } else if motion_error {
+            self.toast("Smooth motion can't run on this graphics card.", true);
+        }
         if end {
             self.end_session(ctx);
         }
     }
+}
+
+/// Test runs: with XMOUSE_PICTURE_DUMP set to a folder, a few of the pictures the pipeline
+/// puts on screen are written there (in-between frames are named so), to look at them
+/// without a console or a person at the screen.
+fn dump_picture(p: &Pipeline, gl: &eframe::glow::Context, pic: &mut PictureState, frames: u64) {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    let Some(dir) = DIR.get_or_init(|| std::env::var_os("XMOUSE_PICTURE_DUMP").map(Into::into))
+    else {
+        return;
+    };
+    // (Well into the stream, so the frame timing has settled.)
+    // (An odd key for an in-between frame, so a real frame that follows it is told apart
+    // even when no new frame came in between.)
+    let key = (p.version() + pic.vsr_version) * 2 + pic.showing_mid as u64;
+    if frames < 240 || pic.dumped.0 >= 6 || pic.dumped.1 == key {
+        return;
+    }
+    // Real and in-between frames in turn (a repeat of the picture on screen is skipped).
+    if pic.dumped.0 > 0 && (pic.dumped.1 % 2 == 1) == pic.showing_mid {
+        return;
+    }
+    if let Some((w, h, px)) = p.read_output(gl) {
+        let kind = if pic.showing_mid { "mid" } else { "real" };
+        write_bmp(&dir.join(format!("{}-{kind}.bmp", pic.dumped.0)), w, h, &px);
+        pic.dumped = (pic.dumped.0 + 1, key);
+    }
+}
+
+/// Test runs: XMOUSE_PICTURE_SIZE=2560x1440 makes the GPU scale to that size whatever the
+/// window's size is (to look at upscaling without a large window).
+fn forced_picture_size() -> Option<[u32; 2]> {
+    static SIZE: std::sync::OnceLock<Option<[u32; 2]>> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        let v = std::env::var("XMOUSE_PICTURE_SIZE").ok()?;
+        let (w, h) = v.split_once('x')?;
+        Some([w.parse().ok()?, h.parse().ok()?])
+    })
 }
 
 fn player_id() -> egui::ViewportId {
@@ -3950,10 +4491,19 @@ fn player_window(
                 let pic = egui::Rect::from_center_size(rect.center(), fit);
                 picture = pic;
                 let ppp = ui.ctx().pixels_per_point();
-                s.vsr_target = [
+                s.vsr_target = forced_picture_size().unwrap_or([
                     (fit.x * ppp).round().max(16.0) as u32,
                     (fit.y * ppp).round().max(16.0) as u32,
-                ];
+                ]);
+                // Where this window is on the desktop, to know its display's refresh rate.
+                s.pic.player_center = ui.ctx().input(|i| {
+                    let v = i.viewport();
+                    let scale = v.native_pixels_per_point.unwrap_or(1.0);
+                    v.outer_rect.map(|r| {
+                        let c = r.center() * scale;
+                        [c.x as i32, c.y as i32]
+                    })
+                });
                 if let Some((id, uv)) = s.vsr_tex {
                     ui.painter().image(
                         id,

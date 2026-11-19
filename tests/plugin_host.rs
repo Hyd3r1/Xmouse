@@ -161,14 +161,14 @@ async fn wait_until(what: &str, secs: u64, mut ok: impl FnMut() -> bool) {
 /// Size and the colour in the lower middle of the newest decoded picture (the flat part of
 /// the fake plugin's test picture).
 fn picture(shared: &Shared) -> Option<([usize; 2], [i32; 3])> {
-    match shared.video.lock().unwrap().as_ref()? {
+    shared.video.with_newest(|f| match f {
         VideoFrame::Rgba(img) => {
             let [w, h] = img.size;
             let p = img.pixels[(h * 3 / 4) * w + w / 2];
             Some(([w, h], [p.r() as i32, p.g() as i32, p.b() as i32]))
         }
         VideoFrame::Nv12 { .. } => None,
-    }
+    })?
 }
 
 /// Run a session that is expected to end by itself with an error; returns the error text.
@@ -305,7 +305,7 @@ async fn tv_play_sends_input_but_decodes_nothing() {
     assert!(shared.frames_sent.load(Ordering::Relaxed) > 0);
     assert_eq!(shared.video_frames.load(Ordering::Relaxed), 0, "no decoding in TV Play");
     assert_eq!(stats.audio_decoded.load(Ordering::Relaxed), 0);
-    assert!(shared.video.lock().unwrap().is_none());
+    assert!(shared.video.is_empty());
     shared.stop();
     tokio::time::timeout(Duration::from_secs(10), task).await.expect("stops").unwrap();
     assert_eq!(shared.status().error, None);

@@ -30,6 +30,22 @@ pub struct Settings {
     pub pc_rtx_vsr: bool,
     /// Decode the PC Play video on the graphics card instead of the CPU.
     pub pc_gpu_decode: bool,
+    /// Soften compression blocks, banding and noise in the PC Play picture.
+    pub pc_cleanup: bool,
+    /// Clean-up strength: stronger instead of light.
+    pub pc_cleanup_strong: bool,
+    /// Sharpen the PC Play picture, and how much (0–1).
+    pub pc_sharpen: bool,
+    pub pc_sharpen_amount: f32,
+    /// Colour adjustments: vibrance (0–1), contrast and brightness (0 = unchanged).
+    pub pc_colour: bool,
+    pub pc_vibrance: f32,
+    pub pc_contrast: f32,
+    pub pc_brightness: f32,
+    /// Add in-between frames (frame generation).
+    pub pc_smooth_motion: bool,
+    /// Enlarge the picture with XMouse's own edge-aware scaler when RTX Video isn't used.
+    pub pc_sharp_upscale: bool,
     pub input_hz: u32,
     pub show_hud: bool,
     pub last_console: String,
@@ -51,6 +67,16 @@ impl Default for Settings {
             pc_smooth_scaling: true,
             pc_rtx_vsr: true,
             pc_gpu_decode: false,
+            pc_cleanup: false,
+            pc_cleanup_strong: false,
+            pc_sharpen: false,
+            pc_sharpen_amount: 0.5,
+            pc_colour: false,
+            pc_vibrance: 0.0,
+            pc_contrast: 0.0,
+            pc_brightness: 0.0,
+            pc_smooth_motion: false,
+            pc_sharp_upscale: false,
             input_hz: 120,
             show_hud: true,
             last_console: String::new(),
@@ -205,6 +231,40 @@ mod tests {
             s.profiles()[0].mouse.sensitivity,
             builtin_profiles()[0].mouse.sensitivity
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn picture_switches_default_to_off_and_old_settings_files_still_load() {
+        let d = Settings::default();
+        assert!(!d.pc_cleanup && !d.pc_cleanup_strong && !d.pc_sharpen && !d.pc_colour);
+        assert!(!d.pc_smooth_motion && !d.pc_sharp_upscale);
+        assert_eq!((d.pc_vibrance, d.pc_contrast, d.pc_brightness), (0.0, 0.0, 0.0));
+        // A settings file written before these existed: its values are kept, the new ones
+        // come in switched off.
+        let dir = std::env::temp_dir().join(format!("xmouse-test-{}", uuid::Uuid::new_v4()));
+        let s = Storage::new(dir.clone());
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"tvBitrate":1500,"pcBitrate":20000,"pcHighQuality":true,"pcSmoothScaling":false,
+                "pcRtxVsr":false,"pcGpuDecode":true,"inputHz":60,"showHud":false,
+                "lastConsole":"X","lastProfile":"gta-v","lastMode":"pc"}"#,
+        )
+        .unwrap();
+        let old = s.settings();
+        assert_eq!((old.tv_bitrate, old.pc_bitrate, old.input_hz), (1500, 20000, 60));
+        assert!(!old.pc_smooth_scaling && old.pc_gpu_decode && old.last_mode == PlayMode::Pc);
+        assert!(!old.pc_cleanup && !old.pc_sharpen && !old.pc_colour && !old.pc_smooth_motion);
+        assert_eq!(old.pc_sharpen_amount, d.pc_sharpen_amount);
+        // And they survive a save and load.
+        let mut new = old.clone();
+        new.pc_smooth_motion = true;
+        new.pc_vibrance = 0.35;
+        s.save_settings(&new);
+        assert_eq!(s.settings(), new);
+        assert!(std::fs::read_to_string(dir.join("settings.json"))
+            .unwrap()
+            .contains("\"pcSmoothMotion\": true"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

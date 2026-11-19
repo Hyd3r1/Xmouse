@@ -64,6 +64,60 @@ pub enum VideoFrame {
     },
 }
 
+/// A decoded frame and when it came out of the decoder.
+pub struct TimedFrame {
+    pub at: Instant,
+    pub frame: VideoFrame,
+}
+
+/// How many decoded frames may wait for the UI. The UI normally takes each one within a
+/// millisecond or two; this only fills when it stalls, and then the oldest are dropped.
+pub const VIDEO_QUEUE: usize = 3;
+
+/// Decoded frames on their way to the UI, oldest first.
+///
+/// This used to be a one-slot mailbox, which silently lost a frame whenever the UI was a
+/// little late. For telling repeated frames from new ones (and for in-between frames) every
+/// frame has to be seen, with its arrival time, so a few are kept. Latency is unchanged: the
+/// UI still shows the newest.
+#[derive(Default)]
+pub struct VideoQueue(Mutex<VecDeque<TimedFrame>>);
+
+impl VideoQueue {
+    pub fn push(&self, frame: VideoFrame) {
+        let mut q = self.0.lock().unwrap();
+        while q.len() >= VIDEO_QUEUE {
+            q.pop_front();
+        }
+        q.push_back(TimedFrame {
+            at: Instant::now(),
+            frame,
+        });
+    }
+
+    /// Everything that is waiting, oldest first.
+    pub fn drain(&self) -> Vec<TimedFrame> {
+        self.0.lock().unwrap().drain(..).collect()
+    }
+
+    /// Look at the newest waiting frame without taking it.
+    pub fn with_newest<R>(&self, look: impl FnOnce(&VideoFrame) -> R) -> Option<R> {
+        self.0.lock().unwrap().back().map(|f| look(&f.frame))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.lock().unwrap().is_empty()
+    }
+
+    /// Size of the newest waiting frame.
+    pub fn newest_size(&self) -> Option<(usize, usize)> {
+        self.with_newest(|f| match f {
+            VideoFrame::Rgba(img) => (img.size[0], img.size[1]),
+            VideoFrame::Nv12 { width, height, .. } => (*width, *height),
+        })
+    }
+}
+
 /// State shared between the UI thread and the connection tasks.
 pub struct Shared {
     pub mapper: Mutex<Mapper>,
@@ -78,7 +132,7 @@ pub struct Shared {
     pub want_nv12: AtomicBool,
     /// Decode the video on the graphics card (set before the stream starts).
     pub gpu_decode: AtomicBool,
-    pub video: Mutex<Option<VideoFrame>>,
+    pub video: VideoQueue,
     acks: Mutex<VecDeque<FrameMeta>>,
     keyframe_wanted: AtomicBool,
     stop_tx: watch::Sender<bool>,
@@ -104,7 +158,7 @@ impl Shared {
             video_packets: AtomicU64::new(0),
             want_nv12: AtomicBool::new(false),
             gpu_decode: AtomicBool::new(false),
-            video: Mutex::new(None),
+            video: VideoQueue::default(),
             acks: Mutex::new(VecDeque::new()),
             keyframe_wanted: AtomicBool::new(false),
             stop_tx,
@@ -326,6 +380,14 @@ pub async fn run_demo_session(shared: Arc<Shared>, repaint: Repaint) {
     }
     shared.set(Phase::Connected, "Connected");
     repaint();
+    // XMOUSE_TEST_VIDEO=30 (or 60): a moving test picture instead of a console, to check the
+    // picture settings by eye.
+    if let Some(fps) = std::env::var("XMOUSE_TEST_VIDEO")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        crate::testvideo::spawn(shared.clone(), repaint.clone(), fps);
+    }
     while !shared.stopped() {
         tokio::time::sleep(Duration::from_millis(16)).await;
         shared.frame();
@@ -1034,6 +1096,34 @@ pub fn request_keyframe(shared: &Shared) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_queue_keeps_the_newest_few_frames_in_order_with_their_times() {
+        let q = VideoQueue::default();
+        assert!(q.is_empty() && q.drain().is_empty());
+        let frame = |w: usize| VideoFrame::Nv12 {
+            width: w,
+            height: 2,
+            data: vec![0; w * 3],
+        };
+        for w in [2, 4, 6, 8, 10] {
+            q.push(frame(w));
+        }
+        // Bounded: the two oldest were dropped, never the newest.
+        assert_eq!(q.newest_size(), Some((10, 2)));
+        let frames = q.drain();
+        let widths: Vec<usize> = frames
+            .iter()
+            .map(|f| match &f.frame {
+                VideoFrame::Nv12 { width, .. } => *width,
+                VideoFrame::Rgba(_) => 0,
+            })
+            .collect();
+        assert_eq!(widths, [6, 8, 10]);
+        assert_eq!(frames.len(), VIDEO_QUEUE);
+        assert!(frames.windows(2).all(|p| p[0].at <= p[1].at));
+        assert!(q.is_empty());
+    }
 
     /// Diagnostic: print the SDP offer we send the console (`cargo test dump_offer -- --ignored --nocapture`).
     #[tokio::test]

@@ -2,7 +2,8 @@
 //!
 //! Latency rules: the decoder never builds a backlog. Every frame is decoded (H.264 needs the
 //! reference frames), but only the newest decoded frame of each batch is converted to pixels and
-//! handed to the UI; older ones are skipped. The UI shows whatever is newest (a one-slot mailbox).
+//! handed to the UI; older ones are skipped. The UI shows whatever is newest (frames wait in a
+//! queue of three so it can see each one's arrival time, never to be shown late).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
@@ -213,7 +214,7 @@ fn to_nv12(yuv: &impl YUVSource, w: usize, h: usize) -> Vec<u8> {
 }
 
 /// NV12 (BT.709, limited range, as the console sends it) → RGBA.
-fn nv12_to_rgba(nv12: &[u8], w: usize, h: usize, out: &mut Vec<u8>) {
+pub(crate) fn nv12_to_rgba(nv12: &[u8], w: usize, h: usize, out: &mut Vec<u8>) {
     out.resize(w * h * 4, 255);
     let uv = &nv12[w * h..];
     for row in 0..h {
@@ -232,12 +233,12 @@ fn nv12_to_rgba(nv12: &[u8], w: usize, h: usize, out: &mut Vec<u8>) {
     }
 }
 
-/// Hand a decoded picture to the UI (one-slot mailbox: the newest wins).
-fn publish(shared: &Shared, repaint: &Repaint, frame: VideoFrame, w: usize, h: usize) {
+/// Hand a decoded picture to the UI (a short queue: see `VideoQueue`).
+pub(crate) fn publish(shared: &Shared, repaint: &Repaint, frame: VideoFrame, w: usize, h: usize) {
     if shared.video_frames.load(Ordering::Relaxed) == 0 {
         log::info!("first decoded video frame: {w}x{h}");
     }
-    *shared.video.lock().unwrap() = Some(frame);
+    shared.video.push(frame);
     shared.video_frames.fetch_add(1, Ordering::Relaxed);
     repaint();
 }
@@ -516,11 +517,8 @@ mod tests {
     fn wait_for_picture(shared: &Shared) -> (usize, usize) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if let Some(f) = shared.video.lock().unwrap().as_ref() {
-                return match f {
-                    VideoFrame::Rgba(img) => (img.size[0], img.size[1]),
-                    VideoFrame::Nv12 { width, height, .. } => (*width, *height),
-                };
+            if let Some(size) = shared.video.newest_size() {
+                return size;
             }
             assert!(Instant::now() < deadline, "no decoded picture");
             std::thread::sleep(Duration::from_millis(10));

@@ -59,26 +59,27 @@ const XBOX: Layout = Layout {
     trigger_names: ("LT", "RT"),
 };
 
-/// The DualSense drawing: two base rings per stick. Its lines are thickened when the asset is
-/// made and the ring widths here are the Xbox ones scaled to this drawing, so both controllers
-/// look equally bold at the same size.
+/// The DualSense drawing: two base rings per stick. The asset is made at twice the source
+/// drawing's size (1062 x 720, so it's shrunk on screen and stays sharp) with its lines
+/// thickened; all numbers here are in those pixels. Ring widths are the Xbox ones scaled to
+/// this drawing, so both controllers look equally bold at the same size.
 const DUALSENSE: Layout = Layout {
     name: "dualsense",
     asset: include_bytes!("../assets/controller-ps.bin"),
-    top: 38.0,
-    left_stick: (183.0, 177.0),
-    right_stick: (348.0, 177.0),
-    wells: &[39.5, 33.0],
-    well_line: 2.8,
-    cap_r: 29.5,
-    cap_inner_r: 20.0,
-    cap_line: 3.4,
-    cap_inner_line: 2.1,
-    travel: 9.0,
-    lt_x: 106.0,
-    rt_x: 425.0,
-    bar: (76.0, 20.0),
-    bar_text: 12.0,
+    top: 76.0,
+    left_stick: (366.0, 354.0),
+    right_stick: (696.0, 354.0),
+    wells: &[79.0, 66.0],
+    well_line: 5.6,
+    cap_r: 59.0,
+    cap_inner_r: 40.0,
+    cap_line: 6.8,
+    cap_inner_line: 4.2,
+    travel: 18.0,
+    lt_x: 212.0,
+    rt_x: 850.0,
+    bar: (152.0, 40.0),
+    bar_text: 24.0,
     trigger_names: ("L2", "R2"),
 };
 

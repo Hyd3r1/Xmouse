@@ -203,8 +203,29 @@ public static class PadAsset {
 
   // The DualSense drawing (531 x 360, thin grey lines): used whole, sticks cut out (the app
   // draws them, rings included), every other control flood-filled from inside its outline.
+  // The DualSense source is small and soft, so it's worked on at this many times its size: the
+  // app then shrinks it (sharp) instead of stretching it (blurry). Coordinates below are in
+  // source pixels; S() scales them.
+  const int PsScale = 2;
+  static int S(int v) { return v * PsScale; }
+  static int[] S(int x, int y) { return new[] { x * PsScale, y * PsScale }; }
+
   public static string BuildPs(string src, string outPath) {
-    var bmp = new Bitmap(src); W = bmp.Width; H = bmp.Height;
+    Bitmap bmp;
+    using (var orig = new Bitmap(src)) {
+      bmp = new Bitmap(orig.Width * PsScale, orig.Height * PsScale, PixelFormat.Format24bppRgb);
+      using (var g = Graphics.FromImage(bmp)) {
+        g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+        g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+        // Mirror the edges while resampling; otherwise the border blends with black and comes
+        // out as a frame line round the drawing.
+        using (var attr = new ImageAttributes()) {
+          attr.SetWrapMode(System.Drawing.Drawing2D.WrapMode.TileFlipXY);
+          g.DrawImage(orig, new Rectangle(0, 0, bmp.Width, bmp.Height), 0, 0, orig.Width, orig.Height, GraphicsUnit.Pixel, attr);
+        }
+      }
+    }
+    W = bmp.Width; H = bmp.Height;
     var d = bmp.LockBits(new Rectangle(0, 0, W, H), ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
     var raw = new byte[d.Stride * H]; Marshal.Copy(d.Scan0, raw, 0, raw.Length); bmp.UnlockBits(d); bmp.Dispose();
     lum = new byte[W * H];
@@ -212,40 +233,46 @@ public static class PadAsset {
       int i = y * d.Stride + x * 3; lum[y * W + x] = (byte)((raw[i] + raw[i + 1] + raw[i + 2]) / 3);
     }
     CX = 0; CY = 0; CW = W; CH = H; WallLevel = 225;
-    Sticks = new[] { new[] { 183.0, 177.0 }, new[] { 348.0, 177.0 } };
-    StickCut = 42;
+    Sticks = new[] { new[] { 183.0 * PsScale, 177.0 * PsScale }, new[] { 348.0 * PsScale, 177.0 * PsScale } };
+    StickCut = 42 * PsScale;
     var log = new List<string>();
     using (var w = new BinaryWriter(File.Create(outPath))) {
       w.Write(new[] { (byte)'X', (byte)'P', (byte)'A', (byte)'D' });
       w.Write((ushort)CW); w.Write((ushort)CH);
-      // Thin grey lines: stretch so they come out solid, drop the JPEG haze near white, then
-      // thicken them so they're as bold as the Xbox drawing's at the same size.
+      // Thin, soft grey lines: a short ramp turns them into solid lines with a crisp edge (and
+      // drops the JPEG haze near white), then they're thickened to the Xbox drawing's weight.
       var a = new double[W * H];
-      for (int y = 0; y < H; y++) for (int x = 0; x < W; x++)
-        a[y * W + x] = Math.Min(255, Math.Max(0, (238 - lum[y * W + x]) * 2.4));
-      var thick = Thicken(a, LineGrow);
+      for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+        double t = (238 - lum[y * W + x] - LineFrom) / (double)(LineSolid - LineFrom);
+        t = Math.Min(1, Math.Max(0, t));
+        a[y * W + x] = 255 * t * t * (3 - 2 * t);
+      }
+      var thick = Thicken(a, LineGrow * PsScale);
       for (int y = 0; y < H; y++) for (int x = 0; x < W; x++)
         w.Write(InStick(x, y) ? (byte)0 : (byte)Math.Round(thick[y * W + x]));
       w.Write((byte)15);
-      Region(w, Fill(new[] { new[] { 105, 18 }, new[] { 90, 21 }, new[] { 125, 15 } }, 55, 3, 150, 38), log, "L1");
-      Region(w, Fill(new[] { new[] { 425, 18 }, new[] { 440, 21 }, new[] { 405, 15 } }, 380, 3, 476, 38), log, "R1");
-      Region(w, Disk(Circle(183, 177, 20, new[] { 183, 177 })), log, "LS");
-      Region(w, Disk(Circle(348, 177, 20, new[] { 348, 177 })), log, "RS");
-      Region(w, Fill(new[] { new[] { 145, 50 }, new[] { 145, 45 }, new[] { 145, 56 } }, 132, 32, 158, 68), log, "Create");
-      Region(w, Fill(new[] { new[] { 385, 52 }, new[] { 385, 46 }, new[] { 385, 57 } }, 372, 36, 398, 68), log, "Options");
-      Region(w, Fill(new[] { new[] { 265, 204 }, new[] { 258, 204 }, new[] { 272, 204 } }, 246, 196, 284, 212), log, "PS");
-      Region(w, Disk(Circle(425, 70, 17)), log, "Triangle");
-      Region(w, Disk(Circle(388, 106, 17)), log, "Square");
-      Region(w, Disk(Circle(425, 144, 17)), log, "Cross");
-      Region(w, Disk(Circle(463, 106, 17)), log, "Circle");
+      Region(w, Fill(new[] { S(105, 18), S(90, 21), S(125, 15) }, S(55), S(3), S(150), S(38)), log, "L1");
+      Region(w, Fill(new[] { S(425, 18), S(440, 21), S(405, 15) }, S(380), S(3), S(476), S(38)), log, "R1");
+      Region(w, Disk(Circle(S(183), S(177), S(20), S(183, 177))), log, "LS");
+      Region(w, Disk(Circle(S(348), S(177), S(20), S(348, 177))), log, "RS");
+      Region(w, Fill(new[] { S(145, 50), S(145, 45), S(145, 56) }, S(132), S(32), S(158), S(68)), log, "Create");
+      Region(w, Fill(new[] { S(385, 52), S(385, 46), S(385, 57) }, S(372), S(36), S(398), S(68)), log, "Options");
+      Region(w, Fill(new[] { S(265, 204), S(258, 204), S(272, 204) }, S(246), S(196), S(284), S(212)), log, "PS");
+      Region(w, Disk(Circle(S(425), S(70), S(17))), log, "Triangle");
+      Region(w, Disk(Circle(S(388), S(106), S(17))), log, "Square");
+      Region(w, Disk(Circle(S(425), S(144), S(17))), log, "Cross");
+      Region(w, Disk(Circle(S(463), S(106), S(17))), log, "Circle");
       // D-pad: four separate keys, each filled from inside (away from its arrow).
-      Region(w, Fill(new[] { new[] { 105, 90 }, new[] { 98, 85 }, new[] { 112, 85 } }, 82, 58, 128, 104), log, "D-up");
-      Region(w, Fill(new[] { new[] { 105, 122 }, new[] { 98, 127 }, new[] { 112, 127 } }, 82, 108, 128, 154), log, "D-down");
-      Region(w, Fill(new[] { new[] { 89, 106 }, new[] { 84, 100 }, new[] { 84, 112 } }, 56, 84, 102, 128), log, "D-left");
-      Region(w, Fill(new[] { new[] { 121, 106 }, new[] { 126, 100 }, new[] { 126, 112 } }, 108, 84, 154, 128), log, "D-right");
+      Region(w, Fill(new[] { S(105, 90), S(98, 85), S(112, 85) }, S(82), S(58), S(128), S(104)), log, "D-up");
+      Region(w, Fill(new[] { S(105, 122), S(98, 127), S(112, 127) }, S(82), S(108), S(128), S(154)), log, "D-down");
+      Region(w, Fill(new[] { S(89, 106), S(84, 100), S(84, 112) }, S(56), S(84), S(102), S(128)), log, "D-left");
+      Region(w, Fill(new[] { S(121, 106), S(126, 100), S(126, 112) }, S(108), S(84), S(154), S(128)), log, "D-right");
     }
     return string.Join("\n", log);
   }
+
+  // Darkness (238 - brightness) where a DualSense line starts, and where it's fully solid.
+  const int LineFrom = 18, LineSolid = 70;
 }
 "@
 New-Item -ItemType Directory -Force (Split-Path $Out) | Out-Null

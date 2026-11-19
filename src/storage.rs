@@ -35,6 +35,11 @@ pub struct Settings {
     pub last_console: String,
     pub last_profile: String,
     pub last_mode: PlayMode,
+    /// Which kind of console you play: "xbox", a plugin's id (e.g. "psnbridge"), or empty
+    /// when a plugin is installed and you haven't chosen yet.
+    pub console_platform: String,
+    /// Account IDs that plugins need for pairing (e.g. a PSN account ID), by plugin id.
+    pub plugin_accounts: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Settings {
@@ -51,6 +56,8 @@ impl Default for Settings {
             last_console: String::new(),
             last_profile: "gta-v".into(),
             last_mode: PlayMode::Tv,
+            console_platform: String::new(),
+            plugin_accounts: Default::default(),
         }
     }
 }

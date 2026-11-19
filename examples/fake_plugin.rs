@@ -1,6 +1,6 @@
 //! A pretend console plugin for testing XMouse's plugin system. No real console is involved:
 //! it offers one "Test Console", accepts the PIN 12345678, and streams a generated picture
-//! (a white bar sliding over a blue background, 640x360 at 30 fps) with a quiet tone.
+//! (a white bar sliding over a blue background, 640x360 at 30 fps) with silent audio.
 //! Holding A turns the background red, so input can be seen to make the round trip.
 //!
 //! It deliberately uses nothing from the `xmouse` crate: the protocol is written out here the
@@ -289,13 +289,14 @@ fn run_stream(out: Out, live: Arc<Live>, s: StreamSettings) {
             misbehave(&out, &s.fault, frames);
         }
 
-        // Audio: a 20 ms Opus packet (quiet 440 Hz tone) every 20 ms.
+        // Audio: a 20 ms Opus packet every 20 ms. Silent on purpose: a test tone played through
+        // someone's speakers for a whole session is painful. (Tests still decode it.)
         if elapsed >= Duration::from_millis(packets * 20) {
             if let Some(enc) = opus.as_mut() {
                 pcm.clear();
                 for _ in 0..960 {
                     phase = (phase + 440.0 * std::f32::consts::TAU / 48_000.0) % std::f32::consts::TAU;
-                    let v = phase.sin() * 0.03;
+                    let v = phase.sin() * 0.0;
                     pcm.extend_from_slice(&[v, v]);
                 }
                 if let Ok(n) = enc.encode_float(&pcm, &mut packet) {

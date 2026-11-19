@@ -88,6 +88,22 @@ impl Action {
     ];
 
     pub fn label(self) -> &'static str {
+        if playstation_names() {
+            match self {
+                Action::A => return "Cross",
+                Action::B => return "Circle",
+                Action::X => return "Square",
+                Action::Y => return "Triangle",
+                Action::LeftShoulder => return "L1",
+                Action::RightShoulder => return "R1",
+                Action::LeftTrigger => return "L2",
+                Action::RightTrigger => return "R2",
+                Action::View => return "Create",
+                Action::Menu => return "Options",
+                Action::Nexus => return "PS button",
+                _ => {}
+            }
+        }
         match self {
             Action::A => "A",
             Action::B => "B",
@@ -204,12 +220,52 @@ impl Binding {
     }
 
     /// Title for lists: the in-game name, or the controller button.
-    pub fn title(&self) -> &str {
+    pub fn title(&self) -> std::borrow::Cow<'_, str> {
         if self.label.is_empty() {
-            self.action.label()
+            self.action.label().into()
+        } else if playstation_names() {
+            playstation_label(&self.label)
         } else {
-            &self.label
+            self.label.as_str().into()
         }
+    }
+}
+
+/// Button names follow the console you play: Xbox names normally, PlayStation names when a
+/// PlayStation is chosen. Only what's shown changes; what's sent never does.
+static PLAYSTATION_NAMES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_playstation_names(on: bool) {
+    PLAYSTATION_NAMES.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn playstation_names() -> bool {
+    PLAYSTATION_NAMES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A binding's in-game name with Xbox button names swapped for PlayStation ones, e.g.
+/// "Cover (RB)" → "Cover (R1)", or a label that is just "A" → "Cross".
+pub fn playstation_label(label: &str) -> std::borrow::Cow<'_, str> {
+    let whole = match label {
+        "A" => Some("Cross"),
+        "B" => Some("Circle"),
+        "X" => Some("Square"),
+        "Y" => Some("Triangle"),
+        "Xbox guide" | "Xbox button" => Some("PS button"),
+        _ => None,
+    };
+    if let Some(w) = whole {
+        return w.into();
+    }
+    const SWAPS: [(&str, &str); 4] = [("(LB)", "(L1)"), ("(RB)", "(R1)"), ("(LT)", "(L2)"), ("(RT)", "(R2)")];
+    if SWAPS.iter().any(|(x, _)| label.contains(x)) {
+        let mut s = label.to_string();
+        for (x, p) in SWAPS {
+            s = s.replace(x, p);
+        }
+        s.into()
+    } else {
+        label.into()
     }
 }
 
@@ -733,6 +789,18 @@ pub fn input_label(code: &str) -> String {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn playstation_names_swap_only_xbox_button_names() {
+        assert_eq!(playstation_label("Cover (RB)"), "Cover (R1)");
+        assert_eq!(playstation_label("Weapon wheel (LB)"), "Weapon wheel (L1)");
+        assert_eq!(playstation_label("Drive-by aim (LB)"), "Drive-by aim (L1)");
+        assert_eq!(playstation_label("A"), "Cross");
+        assert_eq!(playstation_label("Xbox guide"), "PS button");
+        assert_eq!(playstation_label("Run (L3)"), "Run (L3)", "L3/R3 are the same on both");
+        assert_eq!(playstation_label("Sprint"), "Sprint");
+        assert_eq!(playstation_label("Lobby"), "Lobby", "only whole tokens in brackets change");
+    }
 
     #[test]
     fn gta_vi_one_key_per_button() {

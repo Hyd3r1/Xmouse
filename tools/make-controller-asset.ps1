@@ -5,9 +5,14 @@
 # Regions are the areas inside each control's outline, found by flood fill from seed points;
 # the app lights them up under the lines. Order (must match src/padview.rs): LB, RB, LS, RS,
 # View, Menu, Xbox, Y, X, A, B, D-pad up, down, left, right.
+#
+# -Layout ps builds assets/controller-ps.bin from the DualSense drawing instead: same file
+# format and region order, read as L1, R1, (sticks), Create, Options, PS, Triangle, Square,
+# Cross, Circle, D-pad up, down, left, right.
 param(
   [Parameter(Mandatory)] [string]$Source,
-  [string]$Out = (Join-Path $PSScriptRoot "..\assets\controller.bin")
+  [ValidateSet("xbox", "ps")] [string]$Layout = "xbox",
+  [string]$Out = (Join-Path $PSScriptRoot ("..\assets\" + $(if ($Layout -eq "ps") { "controller-ps.bin" } else { "controller.bin" })))
 )
 Add-Type -AssemblyName System.Drawing
 Add-Type -ReferencedAssemblies System.Drawing @"
@@ -19,12 +24,15 @@ using System.IO;
 using System.Runtime.InteropServices;
 
 public static class PadAsset {
-  // Crop of the source drawing that holds the controller.
-  const int CX = 15, CY = 120, CW = 654, CH = 456;
+  // Crop of the source drawing that holds the controller (Xbox drawing; the DualSense
+  // drawing is used whole).
+  static int CX = 15, CY = 120, CW = 654, CH = 456;
+  // Darker than this is a line. The DualSense drawing has thin grey lines.
+  static int WallLevel = 150;
 
   static byte[] lum; static int W, H;
 
-  static bool Wall(int x, int y) { return lum[y * W + x] < 150; }
+  static bool Wall(int x, int y) { return lum[y * W + x] < WallLevel; }
 
   // Flood fill (4-connected) from the seeds, limited to the box; then grow 2 px so the colour
   // reaches under the anti-aliased edge of the line.
@@ -107,8 +115,8 @@ public static class PadAsset {
   }
 
   // Sticks are drawn by the app (so they can move): cut them out of the line art.
-  static readonly double[][] Sticks = { new[] { 173.5, 247.5 }, new[] { 426.0, 348.5 } };
-  const double StickCut = 55;
+  static double[][] Sticks = { new[] { 173.5, 247.5 }, new[] { 426.0, 348.5 } };
+  static double StickCut = 55;
 
   static bool InStick(int x, int y) {
     foreach (var s in Sticks) if ((x - s[0]) * (x - s[0]) + (y - s[1]) * (y - s[1]) <= StickCut * StickCut) return true;
@@ -168,8 +176,53 @@ public static class PadAsset {
     }
     return string.Join("\n", log);
   }
+
+  // The DualSense drawing (531 x 360, thin grey lines): used whole, sticks cut out (the app
+  // draws them, rings included), every other control flood-filled from inside its outline.
+  public static string BuildPs(string src, string outPath) {
+    var bmp = new Bitmap(src); W = bmp.Width; H = bmp.Height;
+    var d = bmp.LockBits(new Rectangle(0, 0, W, H), ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
+    var raw = new byte[d.Stride * H]; Marshal.Copy(d.Scan0, raw, 0, raw.Length); bmp.UnlockBits(d); bmp.Dispose();
+    lum = new byte[W * H];
+    for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+      int i = y * d.Stride + x * 3; lum[y * W + x] = (byte)((raw[i] + raw[i + 1] + raw[i + 2]) / 3);
+    }
+    CX = 0; CY = 0; CW = W; CH = H; WallLevel = 225;
+    Sticks = new[] { new[] { 183.0, 177.0 }, new[] { 348.0, 177.0 } };
+    StickCut = 42;
+    var log = new List<string>();
+    using (var w = new BinaryWriter(File.Create(outPath))) {
+      w.Write(new[] { (byte)'X', (byte)'P', (byte)'A', (byte)'D' });
+      w.Write((ushort)CW); w.Write((ushort)CH);
+      // Thin grey lines: stretch so they come out solid, and drop the JPEG haze near white.
+      for (int y = 0; y < H; y++) for (int x = 0; x < W; x++)
+        w.Write(InStick(x, y) ? (byte)0 : (byte)Math.Min(255, Math.Max(0, (int)((238 - lum[y * W + x]) * 2.4))));
+      w.Write((byte)15);
+      Region(w, Fill(new[] { new[] { 105, 18 }, new[] { 90, 21 }, new[] { 125, 15 } }, 55, 3, 150, 38), log, "L1");
+      Region(w, Fill(new[] { new[] { 425, 18 }, new[] { 440, 21 }, new[] { 405, 15 } }, 380, 3, 476, 38), log, "R1");
+      Region(w, Disk(Circle(183, 177, 20, new[] { 183, 177 })), log, "LS");
+      Region(w, Disk(Circle(348, 177, 20, new[] { 348, 177 })), log, "RS");
+      Region(w, Fill(new[] { new[] { 145, 50 }, new[] { 145, 45 }, new[] { 145, 56 } }, 132, 32, 158, 68), log, "Create");
+      Region(w, Fill(new[] { new[] { 385, 52 }, new[] { 385, 46 }, new[] { 385, 57 } }, 372, 36, 398, 68), log, "Options");
+      Region(w, Fill(new[] { new[] { 265, 204 }, new[] { 258, 204 }, new[] { 272, 204 } }, 246, 196, 284, 212), log, "PS");
+      Region(w, Disk(Circle(425, 70, 17)), log, "Triangle");
+      Region(w, Disk(Circle(388, 106, 17)), log, "Square");
+      Region(w, Disk(Circle(425, 144, 17)), log, "Cross");
+      Region(w, Disk(Circle(463, 106, 17)), log, "Circle");
+      // D-pad: four separate keys, each filled from inside (away from its arrow).
+      Region(w, Fill(new[] { new[] { 105, 90 }, new[] { 98, 85 }, new[] { 112, 85 } }, 82, 58, 128, 104), log, "D-up");
+      Region(w, Fill(new[] { new[] { 105, 122 }, new[] { 98, 127 }, new[] { 112, 127 } }, 82, 108, 128, 154), log, "D-down");
+      Region(w, Fill(new[] { new[] { 89, 106 }, new[] { 84, 100 }, new[] { 84, 112 } }, 56, 84, 102, 128), log, "D-left");
+      Region(w, Fill(new[] { new[] { 121, 106 }, new[] { 126, 100 }, new[] { 126, 112 } }, 108, 84, 154, 128), log, "D-right");
+    }
+    return string.Join("\n", log);
+  }
 }
 "@
 New-Item -ItemType Directory -Force (Split-Path $Out) | Out-Null
-[PadAsset]::Build((Resolve-Path $Source).Path, [IO.Path]::GetFullPath($Out))
+if ($Layout -eq "ps") {
+  [PadAsset]::BuildPs((Resolve-Path $Source).Path, [IO.Path]::GetFullPath($Out))
+} else {
+  [PadAsset]::Build((Resolve-Path $Source).Path, [IO.Path]::GetFullPath($Out))
+}
 "wrote $Out ($((Get-Item $Out).Length) bytes)"

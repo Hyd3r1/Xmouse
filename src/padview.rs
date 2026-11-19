@@ -1,8 +1,9 @@
-//! Live controller drawing: shows exactly what is being sent to the Xbox.
+//! Live controller drawing: shows exactly what is being sent to the console.
 //!
-//! The controller is a line drawing (assets/controller.bin, made by
-//! tools/make-controller-asset.ps1). Each control's area inside its outline is stored as a mask
-//! and lit in the signal colour under the lines while it's pressed.
+//! The controller is a line drawing (assets/controller.bin for Xbox, controller-ps.bin for a
+//! DualSense, made by tools/make-controller-asset.ps1). Each control's area inside its outline
+//! is stored as a mask and lit in the signal colour under the lines while it's pressed. Which
+//! drawing is used follows the console type (see `crate::profile::playstation_names`).
 
 use egui::{pos2, vec2, Align2, Color32, CornerRadius, Rect, Sense, Stroke, StrokeKind, Ui};
 
@@ -10,12 +11,87 @@ use crate::mapper::PadFrame;
 use crate::profile::Action;
 use crate::theme::{bold, EDGE, IDLE, INK, KEY, SIGNAL};
 
-const ASSET: &[u8] = include_bytes!("../assets/controller.bin");
-/// Room above the drawing for the trigger bars, in drawing pixels.
-const TOP: f32 = 46.0;
+/// One controller drawing and where things are on it (in its own pixels).
+struct Layout {
+    /// Texture cache key.
+    name: &'static str,
+    asset: &'static [u8],
+    /// Room above the drawing for the trigger bars.
+    top: f32,
+    left_stick: (f32, f32),
+    right_stick: (f32, f32),
+    /// The fixed rings around each stick (drawn, since the sticks are cut out of the art).
+    wells: &'static [f32],
+    well_line: f32,
+    /// The moving cap's outer and inner rings and their line widths.
+    cap_r: f32,
+    cap_inner_r: f32,
+    cap_line: f32,
+    cap_inner_line: f32,
+    /// How far the cap moves at full tilt.
+    travel: f32,
+    /// Trigger bars: centre x over each bumper, size, label size, names.
+    lt_x: f32,
+    rt_x: f32,
+    bar: (f32, f32),
+    bar_text: f32,
+    trigger_names: (&'static str, &'static str),
+}
 
-/// The masks in `ASSET`, in file order. The stick masks (`Ls`, `Rs`) stay in the file for its
-/// layout but the sticks themselves are drawn in code.
+const XBOX: Layout = Layout {
+    name: "xbox",
+    asset: include_bytes!("../assets/controller.bin"),
+    top: 46.0,
+    left_stick: (158.5, 127.5),
+    right_stick: (411.0, 228.5),
+    wells: &[48.5],
+    well_line: 3.4,
+    cap_r: 36.5,
+    cap_inner_r: 26.0,
+    cap_line: 4.2,
+    cap_inner_line: 2.6,
+    // A little over the ring, so a tilt is easy to see.
+    travel: 15.0,
+    lt_x: 167.0,
+    rt_x: 487.0,
+    bar: (96.0, 26.0),
+    bar_text: 15.0,
+    trigger_names: ("LT", "RT"),
+};
+
+/// The DualSense drawing: thinner lines, two base rings per stick.
+const DUALSENSE: Layout = Layout {
+    name: "dualsense",
+    asset: include_bytes!("../assets/controller-ps.bin"),
+    top: 38.0,
+    left_stick: (183.0, 177.0),
+    right_stick: (348.0, 177.0),
+    wells: &[39.0, 33.5],
+    well_line: 1.5,
+    cap_r: 30.0,
+    cap_inner_r: 20.0,
+    cap_line: 1.8,
+    cap_inner_line: 1.3,
+    travel: 9.0,
+    lt_x: 106.0,
+    rt_x: 425.0,
+    bar: (76.0, 20.0),
+    bar_text: 12.0,
+    trigger_names: ("L2", "R2"),
+};
+
+/// The drawing for the console type in use.
+fn layout() -> &'static Layout {
+    if crate::profile::playstation_names() {
+        &DUALSENSE
+    } else {
+        &XBOX
+    }
+}
+
+/// The masks in an asset, in file order (named for Xbox; on a DualSense they are L1, R1,
+/// Create, Options, PS, Triangle, Square, Cross, Circle). The stick masks (`Ls`, `Rs`) stay in
+/// the file for its layout but the sticks themselves are drawn in code.
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
 enum Part {
@@ -53,22 +129,8 @@ const PARTS: [(Part, Action); 13] = [
     (Part::Right, Action::DPadRight),
 ];
 
-/// The sticks, cut out of the line art and drawn here so they can move (drawing pixels,
-/// relative to the crop; measured from the drawing's rings).
-const LEFT_STICK: (f32, f32) = (158.5, 127.5);
-const RIGHT_STICK: (f32, f32) = (411.0, 228.5);
-/// The fixed ring around each stick.
-const WELL_R: f32 = 48.5;
-/// The cap's outer and inner rings.
-const CAP_R: f32 = 36.5;
-const CAP_INNER_R: f32 = 26.0;
-/// How far the cap moves at full tilt (a little over the ring, so a tilt is easy to see).
-const STICK_TRAVEL: f32 = 15.0;
-/// Number of masks in the asset file.
+/// Number of masks in an asset file.
 const PART_COUNT: usize = 15;
-/// Trigger bars: centre x over each bumper.
-const LT_X: f32 = 167.0;
-const RT_X: f32 = 487.0;
 
 struct Mask {
     min: [usize; 2],
@@ -116,13 +178,13 @@ struct Textures {
     parts: Vec<(Rect, egui::TextureHandle)>,
 }
 
-/// White, alpha-only textures (tinted when drawn), uploaded once per egui context.
-fn textures(ctx: &egui::Context) -> Textures {
-    let id = egui::Id::unique("xmouse-controller-textures");
+/// White, alpha-only textures (tinted when drawn), uploaded once per egui context and layout.
+fn textures(ctx: &egui::Context, layout: &Layout) -> Textures {
+    let id = egui::Id::unique(("xmouse-controller-textures", layout.name));
     if let Some(t) = ctx.data(|d| d.get_temp::<Textures>(id)) {
         return t;
     }
-    let asset = parse(ASSET);
+    let asset = parse(layout.asset);
     let opts = egui::TextureOptions {
         mipmap_mode: Some(egui::TextureFilter::Linear),
         ..egui::TextureOptions::LINEAR
@@ -136,7 +198,11 @@ fn textures(ctx: &egui::Context) -> Textures {
                 .collect(),
         )
     };
-    let lines = ctx.load_texture("controller-lines", image(asset.size, &asset.lines), opts);
+    let lines = ctx.load_texture(
+        format!("controller-lines-{}", layout.name),
+        image(asset.size, &asset.lines),
+        opts,
+    );
     let parts = asset
         .parts
         .iter()
@@ -148,7 +214,11 @@ fn textures(ctx: &egui::Context) -> Textures {
             );
             (
                 r,
-                ctx.load_texture(format!("controller-part-{i}"), image(m.size, &m.alpha), opts),
+                ctx.load_texture(
+                    format!("controller-part-{}-{i}", layout.name),
+                    image(m.size, &m.alpha),
+                    opts,
+                ),
             )
         })
         .collect();
@@ -163,11 +233,12 @@ fn textures(ctx: &egui::Context) -> Textures {
 
 /// Draw the controller `width` points wide.
 pub fn pad_view(ui: &mut Ui, f: &PadFrame, width: f32) {
-    let tex = textures(ui.ctx());
+    let l = layout();
+    let tex = textures(ui.ctx(), l);
     let (dw, dh) = (tex.size[0] as f32, tex.size[1] as f32);
     let s = width / dw;
-    let (rect, _) = ui.allocate_exact_size(vec2(dw * s, (dh + TOP) * s), Sense::hover());
-    let origin = rect.min + vec2(0.0, TOP * s);
+    let (rect, _) = ui.allocate_exact_size(vec2(dw * s, (dh + l.top) * s), Sense::hover());
+    let origin = rect.min + vec2(0.0, l.top * s);
     let at = |x: f32, y: f32| origin + vec2(x * s, y * s);
     let painter = ui.painter_at(rect.expand(2.0));
     let full_uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
@@ -184,27 +255,30 @@ pub fn pad_view(ui: &mut Ui, f: &PadFrame, width: f32) {
     let drawing = Rect::from_min_size(origin, vec2(dw * s, dh * s));
     painter.image(tex.lines.id(), drawing, full_uv, INK);
 
-    // Sticks: a fixed ring and a cap that moves with the stick.
+    // Sticks: fixed rings and a cap that moves with the stick.
     for ((cx, cy), x, y, click) in [
-        (LEFT_STICK, f.lx, f.ly, Action::LeftThumb),
-        (RIGHT_STICK, f.rx, f.ry, Action::RightThumb),
+        (l.left_stick, f.lx, f.ly, Action::LeftThumb),
+        (l.right_stick, f.rx, f.ry, Action::RightThumb),
     ] {
-        painter.circle_stroke(at(cx, cy), WELL_R * s, Stroke::new(3.4 * s, INK));
+        for &well in l.wells {
+            painter.circle_stroke(at(cx, cy), well * s, Stroke::new(l.well_line * s, INK));
+        }
         let (x, y) = (x.clamp(-1.0, 1.0), y.clamp(-1.0, 1.0));
-        let cap = at(cx + x * STICK_TRAVEL, cy + y * STICK_TRAVEL);
+        let cap = at(cx + x * l.travel, cy + y * l.travel);
         // Looks like the drawing (white cap) and just moves; lit only when clicked in.
         let fill = if f.pressed(click) { SIGNAL } else { KEY };
-        painter.circle_filled(cap, CAP_R * s, fill);
-        painter.circle_stroke(cap, CAP_R * s, Stroke::new(4.2 * s, INK));
-        painter.circle_stroke(cap, CAP_INNER_R * s, Stroke::new(2.6 * s, INK));
+        painter.circle_filled(cap, l.cap_r * s, fill);
+        painter.circle_stroke(cap, l.cap_r * s, Stroke::new(l.cap_line * s, INK));
+        painter.circle_stroke(cap, l.cap_inner_r * s, Stroke::new(l.cap_inner_line * s, INK));
     }
 
     // Triggers: bars above the bumpers that fill with the trigger value.
     let r = |v: f32| CornerRadius::same((v * s).min(255.0) as u8);
-    for (cx, v, label) in [(LT_X, f.lt, "LT"), (RT_X, f.rt, "RT")] {
+    let (lt_name, rt_name) = l.trigger_names;
+    for (cx, v, label) in [(l.lt_x, f.lt, lt_name), (l.rt_x, f.rt, rt_name)] {
         let bar = Rect::from_center_size(
-            origin + vec2(cx * s, -TOP * s / 2.0),
-            vec2(96.0 * s, 26.0 * s),
+            origin + vec2(cx * s, -l.top * s / 2.0),
+            vec2(l.bar.0 * s, l.bar.1 * s),
         );
         painter.rect_filled(bar.translate(vec2(0.0, 3.0 * s)), r(9.0), EDGE);
         painter.rect(bar, r(9.0), IDLE, Stroke::new(1.0, EDGE), StrokeKind::Inside);
@@ -212,7 +286,7 @@ pub fn pad_view(ui: &mut Ui, f: &PadFrame, width: f32) {
             let fill = Rect::from_min_size(bar.min, vec2(bar.width() * v.min(1.0), bar.height()));
             painter.rect_filled(fill, r(9.0), SIGNAL);
         }
-        painter.text(bar.center(), Align2::CENTER_CENTER, label, bold(15.0 * s), INK);
+        painter.text(bar.center(), Align2::CENTER_CENTER, label, bold(l.bar_text * s), INK);
     }
 }
 
@@ -221,15 +295,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn controller_asset_has_every_part_inside_the_drawing() {
-        let a = parse(ASSET);
-        assert_eq!(a.lines.len(), a.size[0] * a.size[1]);
-        assert_eq!(a.parts.len(), PART_COUNT);
+    fn controller_assets_have_every_part_inside_the_drawing() {
+        for l in [&XBOX, &DUALSENSE] {
+            check_layout(l);
+        }
+    }
+
+    fn check_layout(l: &Layout) {
+        let a = parse(l.asset);
+        assert_eq!(a.lines.len(), a.size[0] * a.size[1], "{}", l.name);
+        assert_eq!(a.parts.len(), PART_COUNT, "{}", l.name);
         for m in &a.parts {
             assert!(m.min[0] + m.size[0] <= a.size[0] && m.min[1] + m.size[1] <= a.size[1]);
-            assert!(m.alpha.iter().any(|&v| v > 0), "empty mask");
+            assert!(m.alpha.iter().any(|&v| v > 0), "empty mask in {}", l.name);
         }
-        for (cx, cy) in [LEFT_STICK, RIGHT_STICK] {
+        for (cx, cy) in [l.left_stick, l.right_stick] {
             let ls = &a.parts[Part::Ls as usize];
             let rs = &a.parts[Part::Rs as usize];
             let inside = |m: &Mask| {

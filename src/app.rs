@@ -50,8 +50,9 @@ struct Bg {
     /// Consoles offered by plugins (listed after the Xbox ones), and which need pairing first.
     plugin_consoles: Vec<ConsoleInfo>,
     needs_pairing: std::collections::HashSet<String>,
-    /// Plugins are still being asked for their consoles.
+    /// Plugins are still being asked for their consoles / have answered at least once.
     plugins_loading: bool,
+    plugins_loaded: bool,
     /// Outcome of the last pairing attempt, picked up by the pairing window.
     pair_result: Option<Result<(), String>>,
     toasts: Vec<(String, bool)>,
@@ -78,14 +79,6 @@ fn plugin_console_ref(server_id: &str) -> Option<(&str, &str)> {
     server_id.strip_prefix(PLUGIN_PREFIX)?.split_once(':')
 }
 
-/// Xbox consoles first, then the plugins' (still shown if the Xbox service can't be reached).
-fn all_consoles(b: &Bg) -> Option<Result<Vec<ConsoleInfo>, String>> {
-    match &b.consoles {
-        Some(Ok(l)) => Some(Ok(l.iter().chain(&b.plugin_consoles).cloned().collect())),
-        Some(Err(_)) if !b.plugin_consoles.is_empty() => Some(Ok(b.plugin_consoles.clone())),
-        other => other.clone(),
-    }
-}
 
 struct Session {
     paused: bool,
@@ -226,7 +219,7 @@ impl XMouseApp {
             Some("setup") => Page::Setup,
             _ => Page::Home,
         };
-        Self {
+        let app = Self {
             rt,
             auth,
             settings,
@@ -258,7 +251,9 @@ impl XMouseApp {
             vsr_watch: (0, 0),
             vsr_guard_armed: false,
             vsr_guard_target: [0, 0],
-        }
+        };
+        app.apply_platform_names();
+        app
     }
 
     fn toast(&mut self, msg: impl Into<String>, error: bool) {
@@ -308,6 +303,11 @@ impl XMouseApp {
     }
 
     fn load_consoles(&self) {
+        // Another console type: only its plugin knows the consoles.
+        if self.platform_plugin().is_some() {
+            self.load_plugin_consoles();
+            return;
+        }
         if self.demo {
             let c = |id: &str, name: &str, t: &str, p: &str| ConsoleInfo {
                 server_id: id.into(),
@@ -325,7 +325,6 @@ impl XMouseApp {
                 ),
                 c("F4000000DEMO02", "Bedroom", "XboxSeriesS", "On"),
             ]));
-            self.load_plugin_consoles();
             return;
         }
         let (auth, bg, ctx) = (self.auth.clone(), self.bg.clone(), self.ctx.clone());
@@ -341,7 +340,6 @@ impl XMouseApp {
             b.consoles = Some(res.map_err(|e| format!("{e:#}")));
             ctx.request_repaint();
         });
-        self.load_plugin_consoles();
     }
 
     /// Ask every installed plugin for its consoles (each runs once, in the background).
@@ -392,6 +390,7 @@ impl XMouseApp {
             b.plugin_consoles = list;
             b.needs_pairing = needs_pairing;
             b.plugins_loading = false;
+            b.plugins_loaded = true;
             for e in errors {
                 b.toasts.push((e, true));
             }
@@ -492,14 +491,89 @@ impl XMouseApp {
             p.busy = true;
             p.error = None;
             let (cid, pin) = (cid.to_string(), p.pin.trim().to_string());
+            // Account IDs the plugin needs (e.g. PSN) travel with the pairing request.
+            let mut extra = std::collections::BTreeMap::new();
+            if let Some(acc) = self.settings.plugin_accounts.get(&info.id) {
+                extra.insert("account_id".to_string(), acc.clone());
+            }
             let (bg, ctx) = (self.bg.clone(), self.ctx.clone());
             self.bg.lock().unwrap().pair_result = None;
             self.rt.spawn_blocking(move || {
-                let res = crate::plugin::pair(&info, &cid, &pin, &Default::default())
+                let res = crate::plugin::pair(&info, &cid, &pin, &extra)
                     .map_err(|e| format!("{e:#}"));
                 bg.lock().unwrap().pair_result = Some(res);
                 ctx.request_repaint();
             });
+        }
+    }
+
+    /// The plugin for the console type you chose; `None` means Xbox.
+    fn platform_plugin(&self) -> Option<crate::plugin::PluginInfo> {
+        match self.settings.console_platform.as_str() {
+            "" | "xbox" => None,
+            id => self.plugin(id),
+        }
+    }
+
+    /// A console plugin is installed and you haven't picked Xbox or a plugin's console yet
+    /// (or the plugin you picked was removed).
+    fn choosing_platform(&self) -> bool {
+        !self.plugins.is_empty()
+            && match self.settings.console_platform.as_str() {
+                "" => true,
+                "xbox" => false,
+                id => self.plugin(id).is_none(),
+            }
+    }
+
+    /// "Xbox", or the plugin's platform (e.g. "PlayStation").
+    fn platform_name(&self) -> String {
+        self.platform_plugin()
+            .map(|p| p.platform)
+            .unwrap_or_else(|| "Xbox".into())
+    }
+
+    fn is_playstation(p: &crate::plugin::PluginInfo) -> bool {
+        p.platform.to_ascii_lowercase().contains("playstation")
+    }
+
+    /// Button names and the controller drawing follow the chosen console type.
+    fn apply_platform_names(&self) {
+        crate::profile::set_playstation_names(
+            self.platform_plugin().is_some_and(|p| Self::is_playstation(&p)),
+        );
+    }
+
+    /// Switch console type ("xbox", a plugin id, or "" to choose again).
+    fn set_platform(&mut self, id: &str) {
+        self.settings.console_platform = id.into();
+        self.save_settings();
+        self.apply_platform_names();
+        {
+            let mut b = self.bg.lock().unwrap();
+            b.plugin_consoles.clear();
+            b.plugins_loaded = false;
+        }
+        self.page = Page::Home;
+    }
+
+    /// The consoles for the chosen console type, and whether they're still being looked up.
+    fn console_state(&self) -> (Option<Result<Vec<ConsoleInfo>, String>>, bool) {
+        let platform = self.platform_plugin();
+        let b = self.bg.lock().unwrap();
+        match platform {
+            None => (b.consoles.clone(), b.consoles_loading),
+            Some(p) => {
+                let prefix = plugin_console_key(&p.id, "");
+                let list: Vec<ConsoleInfo> = b
+                    .plugin_consoles
+                    .iter()
+                    .filter(|c| c.server_id.starts_with(&prefix))
+                    .cloned()
+                    .collect();
+                let state = if b.plugins_loaded { Some(Ok(list)) } else { None };
+                (state, b.plugins_loading)
+            }
         }
     }
 
@@ -811,9 +885,30 @@ impl eframe::App for XMouseApp {
         self.pairing_window(&ctx);
 
         let signed_in = self.bg.lock().unwrap().signed_in;
+        let platform = self.platform_plugin();
+        let needs_account = platform.as_ref().is_some_and(|p| {
+            Self::is_playstation(p) && !self.settings.plugin_accounts.contains_key(&p.id)
+        });
         if self.session.is_some() {
             self.session_ui(ui, &ctx, frame);
-        } else if !signed_in {
+        } else if self.choosing_platform() || needs_account {
+            // First the console type, then (PlayStation) the account ID pairing needs.
+            top_bar(ui, None, None);
+            status_bar(ui, if needs_account { "PlayStation" } else { "Pick your console" });
+            egui::CentralPanel::default()
+                .frame(page_frame())
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            if needs_account {
+                                self.plugin_account_page(ui)
+                            } else {
+                                self.platform_page(ui)
+                            }
+                        });
+                });
+        } else if platform.is_none() && !signed_in {
             top_bar(ui, None, None);
             status_bar(ui, "Not signed in");
             egui::CentralPanel::default()
@@ -870,14 +965,14 @@ impl eframe::App for XMouseApp {
 
 impl XMouseApp {
     fn status_line(&self) -> String {
-        let b = self.bg.lock().unwrap();
-        let consoles = match &b.consoles {
+        let consoles = match self.console_state().0 {
             None => "Looking for consoles".to_string(),
             Some(Ok(l)) => format!("{} console{}", l.len(), if l.len() == 1 { "" } else { "s" }),
             Some(Err(_)) => "Consoles unavailable".to_string(),
         };
         format!(
-            "Signed in · {consoles} · {} · {} Hz input",
+            "{} · {consoles} · {} · {} Hz input",
+            if self.platform_plugin().is_some() { self.platform_name() } else { "Signed in".into() },
             self.profile().name,
             self.settings.input_hz
         )
@@ -1092,10 +1187,7 @@ impl XMouseApp {
     // ------------------------------------------------------------------ home
 
     fn home_page(&mut self, ui: &mut Ui) {
-        let (consoles, loading) = {
-            let b = self.bg.lock().unwrap();
-            (all_consoles(&b), b.consoles_loading)
-        };
+        let (consoles, loading) = self.console_state();
         if consoles.is_none() && !loading {
             self.load_consoles();
         }
@@ -1103,6 +1195,7 @@ impl XMouseApp {
             Some(Ok(l)) => l.clone(),
             _ => vec![],
         };
+        let platform_name = self.platform_name();
         let selected = list
             .iter()
             .find(|c| c.server_id == self.settings.last_console)
@@ -1165,7 +1258,7 @@ impl XMouseApp {
                         ui.add_space((ui.available_width() - w).max(0.0) / 2.0);
                         ui.spinner();
                         ui.label(
-                            RichText::new("Looking for your Xbox…")
+                            RichText::new(format!("Looking for your {platform_name}…"))
                                 .font(body(18.0))
                                 .color(MUTED),
                         );
@@ -1188,8 +1281,18 @@ impl XMouseApp {
                             .font(bold(18.0))
                             .color(INK),
                     );
-                    if small_link(ui, "Set up your Xbox").clicked() {
-                        go = Some(Page::Setup);
+                    if platform_name == "Xbox" {
+                        if small_link(ui, "Set up your Xbox").clicked() {
+                            go = Some(Page::Setup);
+                        }
+                    } else {
+                        hint(
+                            ui,
+                            &format!(
+                                "Make sure your {platform_name} is on (or resting) with remote play \
+                                 turned on, and on the same network as this PC."
+                            ),
+                        );
                     }
                 }
                 (Some(Ok(_)), Some(c)) => {
@@ -1321,11 +1424,120 @@ impl XMouseApp {
         }
     }
 
+    /// "Which console do you play?": Xbox, or the console of an installed plugin.
+    fn platform_page(&mut self, ui: &mut Ui) {
+        ui.add_space((ui.available_height() * 0.18).max(20.0));
+        ui.vertical_centered(|ui| {
+            ui.label(
+                RichText::new("Which console do you play?")
+                    .font(display(34.0))
+                    .color(INK),
+            );
+            hint(ui, "You can change this later under More.");
+        });
+        ui.add_space(22.0);
+        let mut choice: Option<String> = None;
+        let cards: Vec<(String, String, String)> = std::iter::once((
+            "xbox".to_string(),
+            "Xbox".to_string(),
+            "Sign in with your Microsoft account".to_string(),
+        ))
+        .chain(self.plugins.iter().map(|p| {
+            (
+                p.id.clone(),
+                p.platform.clone(),
+                format!("Through the {} plugin ({})", p.name, p.license),
+            )
+        }))
+        .collect();
+        let w = cards.len() as f32 * 276.0;
+        centered_row(ui, w, |ui| {
+            ui.spacing_mut().item_spacing.x = 16.0;
+            for (id, name, sub) in &cards {
+                ui.vertical(|ui| {
+                    ui.set_width(260.0);
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    if primary(ui, name, 260.0).clicked() {
+                        choice = Some(id.clone());
+                    }
+                    ui.label(RichText::new(sub).font(body(14.0)).color(MUTED));
+                });
+            }
+        });
+        if let Some(id) = choice {
+            self.set_platform(&id);
+        }
+    }
+
+    /// The account ID a PlayStation plugin needs for pairing, asked once.
+    fn plugin_account_page(&mut self, ui: &mut Ui) {
+        let Some(p) = self.platform_plugin() else { return };
+        let key = egui::Id::unique("plugin-account-draft");
+        let mut draft = ui.data(|d| d.get_temp::<String>(key)).unwrap_or_default();
+        let mut save = false;
+        let mut back = false;
+        ui.add_space((ui.available_height() * 0.18).max(20.0));
+        narrow(ui, 520.0, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new("Your PSN account")
+                        .font(display(32.0))
+                        .color(INK),
+                );
+            });
+            ui.add_space(10.0);
+            hint(
+                ui,
+                &format!(
+                    "Pairing a PlayStation needs your PSN account ID. The {} plugin's instructions \
+                     explain where to find it. It stays on this PC.",
+                    p.name
+                ),
+            );
+            ui.add_space(8.0);
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut draft)
+                    .hint_text("PSN account ID")
+                    .char_limit(64)
+                    .desired_width(f32::INFINITY),
+            );
+            if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                save = true;
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if primary(ui, "Continue", 160.0).clicked() {
+                    save = true;
+                }
+                if secondary(ui, "Other console", 160.0).clicked() {
+                    back = true;
+                }
+            });
+        });
+        ui.data_mut(|d| d.insert_temp(key, draft.clone()));
+        if save && !draft.trim().is_empty() {
+            self.settings
+                .plugin_accounts
+                .insert(p.id.clone(), draft.trim().to_string());
+            self.save_settings();
+            ui.data_mut(|d| d.remove_temp::<String>(key));
+            self.page = Page::Home;
+        }
+        if back {
+            self.set_platform("");
+        }
+    }
+
     fn more_page(&mut self, ui: &mut Ui) {
         let p = self.profile().clone();
         title(ui, "More", &p.name);
         let mut go: Option<Page> = None;
         let mut sign_out = false;
+        let mut change_platform = false;
+        let mut change_account = false;
+        let xbox = self.platform_plugin().is_none();
+        let has_plugins = !self.plugins.is_empty();
+        let platform_name = self.platform_name();
         narrow(ui, 600.0, |ui| {
             section(ui, "This game");
             group(ui, |ui| {
@@ -1341,7 +1553,7 @@ impl XMouseApp {
                         "Press once, not hold",
                         "The button stays pressed until you press again",
                     ),
-                    (Page::Test, "Test", "Try your keys without the Xbox"),
+                    (Page::Test, "Test", "Try your keys without the console"),
                     (
                         Page::Profiles,
                         "Games",
@@ -1358,39 +1570,75 @@ impl XMouseApp {
             });
             section(ui, "This computer");
             group(ui, |ui| {
-                for (i, (pg, t, s)) in [
+                let mut rows = vec![
                     (
                         Page::Picture,
                         "Picture and connection",
                         "TV Play, PC Play and input",
                     ),
-                    (Page::Consoles, "Which console?", "Pick the Xbox to play on"),
-                    (Page::Setup, "Xbox setup", "Remote features and power mode"),
-                ]
-                .into_iter()
-                .enumerate()
-                {
+                    (Page::Consoles, "Which console?", "Pick the console to play on"),
+                ];
+                if xbox {
+                    rows.push((Page::Setup, "Xbox setup", "Remote features and power mode"));
+                }
+                for (i, (pg, t, s)) in rows.into_iter().enumerate() {
                     if row(ui, i == 0, t, s, RowOptions::link(), |_| {}).clicked() {
                         go = Some(pg);
                     }
                 }
+                if has_plugins
+                    && row(
+                        ui,
+                        false,
+                        "Console type",
+                        &format!("{platform_name} · change to another console"),
+                        RowOptions::link(),
+                        |_| {},
+                    )
+                    .clicked()
+                {
+                    change_platform = true;
+                }
             });
             section(ui, "Account");
             group(ui, |ui| {
-                sign_out = row(
-                    ui,
-                    true,
-                    "Sign out",
-                    "Microsoft account",
-                    RowOptions {
-                        danger: true,
-                        ..RowOptions::link()
-                    },
-                    |_| {},
-                )
-                .clicked();
+                if xbox {
+                    sign_out = row(
+                        ui,
+                        true,
+                        "Sign out",
+                        "Microsoft account",
+                        RowOptions {
+                            danger: true,
+                            ..RowOptions::link()
+                        },
+                        |_| {},
+                    )
+                    .clicked();
+                } else {
+                    change_account = row(
+                        ui,
+                        true,
+                        "PSN account ID",
+                        "Change the account used for pairing",
+                        RowOptions::link(),
+                        |_| {},
+                    )
+                    .clicked();
+                }
             });
         });
+        if change_platform {
+            self.set_platform("");
+            return;
+        }
+        if change_account {
+            if let Some(p) = self.platform_plugin() {
+                self.settings.plugin_accounts.remove(&p.id);
+                self.save_settings();
+            }
+            return;
+        }
         if let Some(pg) = go {
             self.page = pg;
         }
@@ -1403,10 +1651,7 @@ impl XMouseApp {
     }
 
     fn consoles_page(&mut self, ui: &mut Ui) {
-        let (consoles, loading) = {
-            let b = self.bg.lock().unwrap();
-            (all_consoles(&b), b.consoles_loading)
-        };
+        let (consoles, loading) = self.console_state();
         if consoles.is_none() && !loading {
             self.load_consoles();
         }
@@ -1451,7 +1696,8 @@ impl XMouseApp {
                 });
             }
             Some(Ok(_)) => {
-                ui.vertical_centered(|ui| hint(ui, "No consoles found. Check the Xbox setup."));
+                let msg = format!("No consoles found. Check the {} setup.", self.platform_name());
+                ui.vertical_centered(|ui| hint(ui, &msg));
             }
             Some(Err(e)) => {
                 ui.vertical_centered(|ui| hint(ui, e));
@@ -1842,7 +2088,7 @@ impl XMouseApp {
                         let r = row(
                             ui,
                             bi == 0,
-                            b.title(),
+                            &b.title(),
                             &sub,
                             RowOptions {
                                 clickable: true,
@@ -2009,7 +2255,7 @@ impl XMouseApp {
                         ui,
                         false,
                         "Test",
-                        "Try your keys without the Xbox",
+                        "Try your keys without the console",
                         RowOptions::link(),
                         |_| {},
                     )
@@ -2549,7 +2795,7 @@ impl XMouseApp {
         title(
             ui,
             "Test",
-            &format!("{} · nothing is sent to the Xbox", profile.name),
+            &format!("{} · nothing is sent to the console", profile.name),
         );
         if self.editor.test.is_none() {
             self.editor.test = Some(TestPad {
@@ -3632,6 +3878,14 @@ fn short_game(g: &str) -> String {
 
 /// Short controller name for list subtitles (e.g. "RT").
 fn short_action(a: Action) -> &'static str {
+    if crate::profile::playstation_names() {
+        // Action::label already gives the short PlayStation names (L1, R2, Options…).
+        return match a {
+            Action::LeftThumb => "L3",
+            Action::RightThumb => "R3",
+            other => other.label(),
+        };
+    }
     match a {
         Action::LeftShoulder => "LB",
         Action::RightShoulder => "RB",
@@ -3836,7 +4090,12 @@ fn chip_text(a: Action) -> String {
         Action::DPadDown => "D dn".into(),
         Action::DPadLeft => "D lt".into(),
         Action::DPadRight => "D rt".into(),
+        Action::Nexus if crate::profile::playstation_names() => "PS".into(),
         Action::Nexus => "Xbox".into(),
+        Action::A if crate::profile::playstation_names() => "×".into(),
+        Action::B if crate::profile::playstation_names() => "O".into(),
+        Action::X if crate::profile::playstation_names() => "Sq".into(),
+        Action::Y if crate::profile::playstation_names() => "Tri".into(),
         Action::Walk => "Walk".into(),
         Action::None => "".into(),
         other => short_action(other).to_string(),

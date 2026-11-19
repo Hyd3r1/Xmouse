@@ -127,6 +127,72 @@ impl Assembler {
     }
 }
 
+/// Where the decoder thread gets complete H.264 access units from. The decode loop is the same
+/// for every source; only "how do bytes become access units" differs (RTP reassembly for the
+/// Xbox, nothing at all for a source that already delivers whole access units).
+trait FrameSource {
+    type Item: Send + 'static;
+    fn push(&mut self, item: Self::Item);
+    /// Complete access units, oldest first. Returns true when a frame was lost for good.
+    fn pop(&mut self, out: &mut Vec<Vec<u8>>) -> bool;
+}
+
+impl FrameSource for Assembler {
+    type Item = Packet;
+    fn push(&mut self, item: Packet) {
+        Assembler::push(self, item)
+    }
+    fn pop(&mut self, out: &mut Vec<Vec<u8>>) -> bool {
+        Assembler::pop(self, out)
+    }
+}
+
+/// Input of [`spawn_unit_decoder`]: video that is already split into access units.
+pub enum VideoIn {
+    /// One complete access unit in Annex-B form (start codes between NAL units).
+    Unit(Vec<u8>),
+    /// A frame was dropped before it got here: the following ones can't be trusted until the
+    /// next full picture, so the decoder asks for one.
+    Lost,
+}
+
+/// Pass-through source: access units arrive ready-made.
+#[derive(Default)]
+struct Units {
+    ready: Vec<Vec<u8>>,
+    lost: bool,
+}
+
+impl FrameSource for Units {
+    type Item = VideoIn;
+    fn push(&mut self, item: VideoIn) {
+        match item {
+            VideoIn::Unit(data) if !data.is_empty() => self.ready.push(data),
+            VideoIn::Unit(_) => {}
+            VideoIn::Lost => self.lost = true,
+        }
+    }
+    fn pop(&mut self, out: &mut Vec<Vec<u8>>) -> bool {
+        out.append(&mut self.ready);
+        std::mem::take(&mut self.lost)
+    }
+}
+
+/// How many access units may wait for the decoder of [`spawn_unit_decoder`] (2 s at 60 fps).
+/// The decoder drains its queue on every pass, so this only fills if decoding has stalled; the
+/// sender then drops frames (`try_send`) instead of letting memory grow.
+pub const UNIT_QUEUE: usize = 120;
+
+/// Start the decoder thread for a source that delivers whole access units (no RTP). Same
+/// decoding, GPU decoding, newest-frame-wins and keyframe-request behaviour as [`spawn_decoder`].
+/// Use `try_send`: when the queue is full, drop the unit and send [`VideoIn::Lost`] once there
+/// is room again.
+pub fn spawn_unit_decoder(shared: Arc<Shared>, repaint: Repaint) -> mpsc::SyncSender<VideoIn> {
+    let (tx, rx) = mpsc::sync_channel::<VideoIn>(UNIT_QUEUE);
+    spawn_decode_loop(rx, Units::default, shared, repaint);
+    tx
+}
+
 /// I420 planes (with strides) → NV12: the Y plane, then U and V interleaved at half resolution.
 fn to_nv12(yuv: &impl YUVSource, w: usize, h: usize) -> Vec<u8> {
     let (ys, us, vs) = yuv.strides();
@@ -178,6 +244,18 @@ fn publish(shared: &Shared, repaint: &Repaint, frame: VideoFrame, w: usize, h: u
 
 pub fn spawn_decoder(shared: Arc<Shared>, repaint: Repaint) -> mpsc::Sender<Packet> {
     let (tx, rx) = mpsc::channel::<Packet>();
+    spawn_decode_loop(rx, Assembler::new, shared, repaint);
+    tx
+}
+
+/// The decoder thread. `make_source` runs on the new thread (the RTP assembler is built there,
+/// as it always was).
+fn spawn_decode_loop<S: FrameSource + 'static>(
+    rx: mpsc::Receiver<S::Item>,
+    make_source: fn() -> S,
+    shared: Arc<Shared>,
+    repaint: Repaint,
+) {
     std::thread::Builder::new()
         .name("xmouse-video".into())
         .spawn(move || {
@@ -210,7 +288,7 @@ pub fn spawn_decoder(shared: Arc<Shared>, repaint: Repaint) -> mpsc::Sender<Pack
             // Frames fed to the GPU decoder in a row that should have given a picture but didn't.
             #[cfg(windows)]
             let mut gpu_silent = 0u32;
-            let mut builder = Assembler::new();
+            let mut builder = make_source();
             let mut errors = 0u32;
             let mut rgba: Vec<u8> = Vec::new();
             let mut samples: Vec<Vec<u8>> = Vec::new();
@@ -346,7 +424,6 @@ pub fn spawn_decoder(shared: Arc<Shared>, repaint: Repaint) -> mpsc::Sender<Pack
             }
         })
         .expect("spawn video thread");
-    tx
 }
 
 #[cfg(test)]
@@ -416,6 +493,131 @@ mod tests {
         assert_eq!(
             to_nv12(&f, 4, 2),
             vec![1, 2, 3, 4, 5, 6, 7, 8, 10, 20, 11, 21]
+        );
+    }
+
+    /// A few encoded frames of a small grey picture (the first one is a full picture).
+    fn encoded_frames(n: usize) -> Vec<Vec<u8>> {
+        use openh264::encoder::Encoder;
+        use openh264::formats::YUVBuffer;
+        let (w, h) = (320usize, 180usize);
+        let mut enc = Encoder::new().expect("encoder");
+        (0..n)
+            .map(|i| {
+                let mut i420 = vec![128u8; w * h * 3 / 2];
+                i420[..w * h].fill(60 + i as u8 * 10);
+                enc.encode(&YUVBuffer::from_vec(i420, w, h))
+                    .expect("encode")
+                    .to_vec()
+            })
+            .collect()
+    }
+
+    fn wait_for_picture(shared: &Shared) -> (usize, usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(f) = shared.video.lock().unwrap().as_ref() {
+                return match f {
+                    VideoFrame::Rgba(img) => (img.size[0], img.size[1]),
+                    VideoFrame::Nv12 { width, height, .. } => (*width, *height),
+                };
+            }
+            assert!(Instant::now() < deadline, "no decoded picture");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The Xbox path as a whole: RTP packets in through `spawn_decoder`, pictures out in
+    /// `Shared.video`. Pins the behaviour the access-unit split must not change.
+    #[test]
+    fn rtp_decoder_still_turns_packets_into_pictures() {
+        use webrtc::rtp::codecs::h264::H264Payloader;
+        use webrtc::rtp::packetizer::Payloader;
+        let shared = Shared::new(crate::mapper::Mapper::new(
+            crate::profile::builtin_profiles().remove(0),
+        ));
+        let tx: mpsc::Sender<Packet> = spawn_decoder(shared.clone(), Arc::new(|| {}));
+        let mut payloader = H264Payloader::default();
+        let mut seq = 65530u16; // wraps during the test
+        for (i, au) in encoded_frames(6).iter().enumerate() {
+            let parts = payloader.payload(1200, &Bytes::from(au.clone())).unwrap();
+            let last = parts.len() - 1;
+            for (n, payload) in parts.into_iter().enumerate() {
+                seq = seq.wrapping_add(1);
+                tx.send(Packet {
+                    header: Header {
+                        sequence_number: seq,
+                        marker: n == last,
+                        timestamp: i as u32 * 3000,
+                        ..Default::default()
+                    },
+                    payload,
+                })
+                .unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(wait_for_picture(&shared), (320, 180));
+        assert!(shared.video_frames.load(Ordering::Relaxed) >= 1);
+        assert!(!shared.take_keyframe_request(), "nothing was lost");
+        shared.stop();
+    }
+
+    /// The same frames straight in as access units give the same pictures.
+    #[test]
+    fn unit_decoder_turns_access_units_into_pictures() {
+        let shared = Shared::new(crate::mapper::Mapper::new(
+            crate::profile::builtin_profiles().remove(0),
+        ));
+        let tx = spawn_unit_decoder(shared.clone(), Arc::new(|| {}));
+        for au in encoded_frames(6) {
+            tx.send(VideoIn::Unit(au)).unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(wait_for_picture(&shared), (320, 180));
+        assert!(!shared.take_keyframe_request());
+        // A reported loss asks the source for a fresh full picture.
+        tx.send(VideoIn::Lost).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !shared.take_keyframe_request() {
+            assert!(Instant::now() < deadline, "no keyframe request after a loss");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Garbage is refused by the decoder, not fatal: the thread keeps running.
+        tx.send(VideoIn::Unit(vec![0, 0, 0, 1, 0x65, 0xff, 0xff, 0xff]))
+            .unwrap();
+        tx.send(VideoIn::Unit(vec![1, 2, 3])).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(tx.send(VideoIn::Unit(Vec::new())).is_ok(), "decoder thread is still alive");
+        shared.stop();
+    }
+
+    #[test]
+    fn unit_source_passes_units_through_in_order_and_reports_loss_once() {
+        let mut u = Units::default();
+        let mut out = Vec::new();
+        u.push(VideoIn::Unit(vec![1]));
+        u.push(VideoIn::Unit(Vec::new())); // empty: ignored
+        u.push(VideoIn::Lost);
+        u.push(VideoIn::Unit(vec![2]));
+        assert!(u.pop(&mut out));
+        assert_eq!(out, vec![vec![1], vec![2]]);
+        out.clear();
+        assert!(!u.pop(&mut out), "loss is reported once");
+        assert!(out.is_empty());
+    }
+
+    /// The bytes the assembler hands the decoder: each NAL unit behind a 4-byte start code.
+    #[test]
+    fn assembled_frame_is_annex_b() {
+        let mut a = Assembler::new();
+        let mut out = Vec::new();
+        a.push(pkt(10, false, 1));
+        a.push(pkt(11, true, 2));
+        assert!(!a.pop(&mut out));
+        assert_eq!(
+            out,
+            vec![vec![0, 0, 0, 1, 0x41, 1, 0, 0, 0, 0, 1, 0x41, 2, 0]]
         );
     }
 

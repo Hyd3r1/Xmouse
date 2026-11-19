@@ -38,61 +38,124 @@ fn push(ring: &SharedRing, pcm: &[f32]) {
     }
 }
 
+/// Opus packets in, sound out: the decoder plus the jitter buffer the output device reads from.
+/// The Xbox RTP loop ([`play`]) and sources that deliver bare Opus packets both feed this.
+pub struct AudioOut {
+    ring: SharedRing,
+    dec: opus::Decoder,
+    pcm: Vec<f32>,
+    errors: u64,
+}
+
+impl AudioOut {
+    /// Open the default output device (on its own thread, until the session stops) and get
+    /// ready to decode. Whatever the sender's sample rate or channel count, Opus decodes to
+    /// the 48 kHz stereo the output expects.
+    pub fn new(shared: Arc<Shared>) -> Result<Self, opus::Error> {
+        let out = Self::without_device();
+        if let Ok(out) = &out {
+            spawn_output(out.ring.clone(), shared);
+        }
+        out
+    }
+
+    /// Decode into the buffer without opening an output device (muted sessions and tests).
+    pub fn without_device() -> Result<Self, opus::Error> {
+        Ok(Self {
+            ring: Arc::new(Mutex::new(Ring {
+                buf: VecDeque::with_capacity(samples(MAX_MS) * 2),
+                primed: false,
+            })),
+            dec: opus::Decoder::new(RATE, opus::Channels::Stereo)?,
+            pcm: vec![0f32; 5760 * 2], // 120 ms, the largest Opus frame
+            errors: 0,
+        })
+    }
+
+    /// Decode one Opus packet and queue it for playback. A packet that doesn't decode is
+    /// skipped (and logged now and then); it never stops the sound.
+    pub fn packet(&mut self, opus: &[u8]) {
+        match self.dec.decode_float(opus, &mut self.pcm, false) {
+            Ok(n) => push(&self.ring, &self.pcm[..n * 2]),
+            Err(e) => {
+                self.errors += 1;
+                if self.errors == 1 || self.errors % 100 == 0 {
+                    log::warn!("Opus decode error ({}): {e}", self.errors);
+                }
+            }
+        }
+    }
+
+    /// One 20 ms packet went missing: let the decoder fill the hole (packet-loss concealment).
+    pub fn conceal(&mut self) {
+        if let Ok(n) = self.dec.decode_float(&[], &mut self.pcm[..960 * 2], false) {
+            push(&self.ring, &self.pcm[..n * 2]);
+        }
+    }
+
+    /// Samples (interleaved stereo) waiting to be played.
+    pub fn buffered(&self) -> usize {
+        self.ring.lock().unwrap().buf.len()
+    }
+}
+
+/// What to do with an RTP packet, given the sequence number of the one before it.
+#[derive(Debug, PartialEq)]
+enum SeqStep {
+    /// Duplicate or late: ignore it.
+    Skip,
+    /// Play it, after concealing this many lost packets (at most 3).
+    Play { conceal: u16 },
+}
+
+fn seq_step(last: Option<u16>, seq: u16) -> SeqStep {
+    let Some(prev) = last else {
+        return SeqStep::Play { conceal: 0 };
+    };
+    let gap = seq.wrapping_sub(prev);
+    if gap == 0 || gap > 0x8000 {
+        SeqStep::Skip
+    } else {
+        SeqStep::Play {
+            conceal: gap.min(4) - 1,
+        }
+    }
+}
+
 /// Read the audio track until it ends, playing it on this PC.
 pub async fn play(track: Arc<TrackRemote>, shared: Arc<Shared>) {
-    let ring: SharedRing = Arc::new(Mutex::new(Ring {
-        buf: VecDeque::with_capacity(samples(MAX_MS) * 2),
-        primed: false,
-    }));
-    spawn_output(ring.clone(), shared.clone());
-
-    let mut dec = match opus::Decoder::new(RATE, opus::Channels::Stereo) {
-        Ok(d) => d,
+    let mut out = match AudioOut::new(shared.clone()) {
+        Ok(out) => out,
         Err(e) => {
             log::error!("Opus decoder unavailable: {e}");
             while track.read_rtp().await.is_ok() {}
             return;
         }
     };
-    let mut pcm = vec![0f32; 5760 * 2]; // 120 ms, the largest Opus frame
     let mut last_seq: Option<u16> = None;
     let mut packets = 0u64;
-    let mut errors = 0u64;
     while let Ok((pkt, _)) = track.read_rtp().await {
         packets += 1;
         if packets == 1 || packets % 3000 == 0 {
             log::info!("audio RTP packets: {packets}");
         }
         let seq = pkt.header.sequence_number;
-        if let Some(prev) = last_seq {
-            let gap = seq.wrapping_sub(prev);
-            if gap == 0 || gap > 0x8000 {
-                continue; // duplicate or late
-            }
-            // Conceal up to 3 lost 20 ms packets.
-            for _ in 1..gap.min(4) {
-                if let Ok(n) = dec.decode_float(&[], &mut pcm[..960 * 2], false) {
-                    push(&ring, &pcm[..n * 2]);
+        match seq_step(last_seq, seq) {
+            SeqStep::Skip => continue,
+            SeqStep::Play { conceal } => {
+                for _ in 0..conceal {
+                    out.conceal();
                 }
             }
         }
         last_seq = Some(seq);
-        match dec.decode_float(&pkt.payload, &mut pcm, false) {
-            Ok(n) => push(&ring, &pcm[..n * 2]),
-            Err(e) => {
-                errors += 1;
-                if errors == 1 || errors % 100 == 0 {
-                    log::warn!("Opus decode error ({errors}): {e}");
-                }
-            }
-        }
+        out.packet(&pkt.payload);
         if shared.stopped() {
             break;
         }
     }
     log::info!("audio track ended after {packets} packets");
 }
-
 /// The cpal stream is not `Send`: own it on its own thread until the session stops.
 fn spawn_output(ring: SharedRing, shared: Arc<Shared>) {
     let _ = std::thread::Builder::new()
@@ -201,4 +264,72 @@ where
         |e| log::warn!("audio output error: {e}"),
         None,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A quiet 440 Hz tone as 20 ms Opus packets (48 kHz stereo).
+    fn tone_packets(n: usize) -> Vec<Vec<u8>> {
+        let mut enc =
+            opus::Encoder::new(RATE, opus::Channels::Stereo, opus::Application::Audio).unwrap();
+        let mut phase = 0f32;
+        (0..n)
+            .map(|_| {
+                let mut pcm = Vec::with_capacity(960 * 2);
+                for _ in 0..960 {
+                    phase += 440.0 * std::f32::consts::TAU / RATE as f32;
+                    let s = phase.sin() * 0.1;
+                    pcm.extend_from_slice(&[s, s]);
+                }
+                let mut out = vec![0u8; 1500];
+                let len = enc.encode_float(&pcm, &mut out).unwrap();
+                out.truncate(len);
+                out
+            })
+            .collect()
+    }
+
+    /// The RTP sequence rules of the Xbox audio loop, unchanged by the split.
+    #[test]
+    fn rtp_sequence_rules() {
+        assert_eq!(seq_step(None, 7), SeqStep::Play { conceal: 0 });
+        assert_eq!(seq_step(Some(7), 8), SeqStep::Play { conceal: 0 });
+        assert_eq!(seq_step(Some(7), 7), SeqStep::Skip, "duplicate");
+        assert_eq!(seq_step(Some(7), 5), SeqStep::Skip, "late");
+        assert_eq!(seq_step(Some(7), 9), SeqStep::Play { conceal: 1 });
+        assert_eq!(seq_step(Some(7), 10), SeqStep::Play { conceal: 2 });
+        assert_eq!(seq_step(Some(7), 11), SeqStep::Play { conceal: 3 });
+        assert_eq!(seq_step(Some(7), 500), SeqStep::Play { conceal: 3 }, "at most 3");
+        assert_eq!(seq_step(Some(65535), 0), SeqStep::Play { conceal: 0 }, "wraps");
+        assert_eq!(seq_step(Some(65535), 1), SeqStep::Play { conceal: 1 });
+        assert_eq!(seq_step(Some(0), 65535), SeqStep::Skip, "late across the wrap");
+    }
+
+    #[test]
+    fn opus_packets_become_buffered_stereo_samples() {
+        let mut out = AudioOut::without_device().unwrap();
+        let packets = tone_packets(3);
+        out.packet(&packets[0]);
+        assert_eq!(out.buffered(), 960 * 2, "20 ms of stereo");
+        out.conceal();
+        assert_eq!(out.buffered(), 960 * 4, "a concealed packet is 20 ms too");
+        out.packet(&packets[1]);
+        // Rubbish is skipped without disturbing what is queued.
+        out.packet(&[0xff; 7]);
+        assert!(out.buffered() >= 960 * 6);
+        let loud = out.ring.lock().unwrap().buf.iter().any(|s| s.abs() > 0.01);
+        assert!(loud, "the tone came through");
+    }
+
+    #[test]
+    fn buffer_never_grows_past_the_backlog_limit() {
+        let mut out = AudioOut::without_device().unwrap();
+        for p in tone_packets(40) {
+            out.packet(&p); // 800 ms with nothing reading
+            assert!(out.buffered() <= samples(MAX_MS));
+        }
+        assert!(out.buffered() >= samples(TARGET_MS));
+    }
 }

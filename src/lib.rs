@@ -5,6 +5,7 @@ pub mod auth;
 pub mod chime;
 pub mod mapper;
 pub mod packet;
+pub mod plugin;
 pub mod profile;
 pub mod ps;
 pub mod storage;

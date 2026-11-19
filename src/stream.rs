@@ -123,13 +123,13 @@ impl Shared {
         self.status.lock().unwrap().clone()
     }
 
-    fn set(&self, phase: Phase, detail: &str) {
+    pub(crate) fn set(&self, phase: Phase, detail: &str) {
         let mut s = self.status.lock().unwrap();
         s.phase = phase;
         s.detail = detail.to_string();
     }
 
-    fn fail(&self, err: String) {
+    pub(crate) fn fail(&self, err: String) {
         let mut s = self.status.lock().unwrap();
         s.phase = Phase::Ended;
         if s.error.is_none() {
@@ -137,12 +137,24 @@ impl Shared {
         }
     }
 
+    /// True once after the decoder asked for a full picture (see `request_keyframe`): the
+    /// session loop passes the request on to whatever is sending the video.
+    pub(crate) fn take_keyframe_request(&self) -> bool {
+        self.keyframe_wanted.swap(false, Ordering::SeqCst)
+    }
+
+    /// Changes when `stop()` is called, for session loops that wait on it.
+    pub(crate) fn stop_signal(&self) -> watch::Receiver<bool> {
+        self.stop_tx.subscribe()
+    }
+
     /// Milliseconds on the mapper's clock (see `epoch`).
     pub fn now_ms(&self) -> f64 {
         self.epoch.elapsed().as_secs_f64() * 1000.0
     }
 
-    fn frame(&self) -> PadFrame {
+    /// One controller state for the input loop: ticks the mapper (or the deadzone finder).
+    pub(crate) fn frame(&self) -> PadFrame {
         let finder = *self.finder.lock().unwrap();
         let mut mapper = self.mapper.lock().unwrap();
         let f = mapper.tick(self.now_ms());

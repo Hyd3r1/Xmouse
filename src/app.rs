@@ -47,7 +47,44 @@ struct Bg {
     device_code: Option<DeviceCode>,
     consoles: Option<Result<Vec<ConsoleInfo>, String>>,
     consoles_loading: bool,
+    /// Consoles offered by plugins (listed after the Xbox ones), and which need pairing first.
+    plugin_consoles: Vec<ConsoleInfo>,
+    needs_pairing: std::collections::HashSet<String>,
+    /// Plugins are still being asked for their consoles.
+    plugins_loading: bool,
+    /// Outcome of the last pairing attempt, picked up by the pairing window.
+    pair_result: Option<Result<(), String>>,
     toasts: Vec<(String, bool)>,
+}
+
+/// The PIN window for pairing a plugin console.
+struct Pairing {
+    console: ConsoleInfo,
+    pin: String,
+    busy: bool,
+    error: Option<String>,
+}
+
+/// Plugin consoles live in the same console list as Xbox ones, with an id that says which
+/// plugin owns them, so picking, "last console" and --play work unchanged.
+const PLUGIN_PREFIX: &str = "plugin:";
+
+fn plugin_console_key(plugin: &str, console: &str) -> String {
+    format!("{PLUGIN_PREFIX}{plugin}:{console}")
+}
+
+/// (plugin id, the plugin's own console id) for a console that comes from a plugin.
+fn plugin_console_ref(server_id: &str) -> Option<(&str, &str)> {
+    server_id.strip_prefix(PLUGIN_PREFIX)?.split_once(':')
+}
+
+/// Xbox consoles first, then the plugins' (still shown if the Xbox service can't be reached).
+fn all_consoles(b: &Bg) -> Option<Result<Vec<ConsoleInfo>, String>> {
+    match &b.consoles {
+        Some(Ok(l)) => Some(Ok(l.iter().chain(&b.plugin_consoles).cloned().collect())),
+        Some(Err(_)) if !b.plugin_consoles.is_empty() => Some(Ok(b.plugin_consoles.clone())),
+        other => other.clone(),
+    }
 }
 
 struct Session {
@@ -109,6 +146,10 @@ pub struct XMouseApp {
     autostart: bool,
     /// --play: start the last console in the last mode as soon as consoles are known.
     play_on_start: bool,
+    /// Installed console plugins (other platforms), found at startup.
+    plugins: Vec<crate::plugin::PluginInfo>,
+    /// The PIN window, while pairing a plugin console.
+    pairing: Option<Pairing>,
     ctx: egui::Context,
     frame_no: u64,
     /// Fake consoles for screenshots / UI testing (XMOUSE_DEMO=1).
@@ -205,6 +246,8 @@ impl XMouseApp {
             toasts: startup_toasts,
             autostart: opts.autostart,
             play_on_start: opts.play,
+            plugins: crate::plugin::discover(),
+            pairing: None,
             ctx: cc.egui_ctx.clone(),
             frame_no: 0,
             demo,
@@ -282,6 +325,7 @@ impl XMouseApp {
                 ),
                 c("F4000000DEMO02", "Bedroom", "XboxSeriesS", "On"),
             ]));
+            self.load_plugin_consoles();
             return;
         }
         let (auth, bg, ctx) = (self.auth.clone(), self.bg.clone(), self.ctx.clone());
@@ -297,9 +341,186 @@ impl XMouseApp {
             b.consoles = Some(res.map_err(|e| format!("{e:#}")));
             ctx.request_repaint();
         });
+        self.load_plugin_consoles();
+    }
+
+    /// Ask every installed plugin for its consoles (each runs once, in the background).
+    fn load_plugin_consoles(&self) {
+        if self.plugins.is_empty() {
+            return;
+        }
+        let (plugins, bg, ctx) = (self.plugins.clone(), self.bg.clone(), self.ctx.clone());
+        bg.lock().unwrap().plugins_loading = true;
+        self.rt.spawn_blocking(move || {
+            let mut list = Vec::new();
+            let mut needs_pairing = std::collections::HashSet::new();
+            let mut errors = Vec::new();
+            for p in &plugins {
+                match crate::plugin::list_consoles(p) {
+                    Ok(consoles) => {
+                        for c in consoles {
+                            let key = plugin_console_key(&p.id, &c.id);
+                            if c.needs_pairing {
+                                needs_pairing.insert(key.clone());
+                            }
+                            list.push(ConsoleInfo {
+                                server_id: key,
+                                name: c.name,
+                                console_type: if c.model.is_empty() {
+                                    p.platform.clone()
+                                } else {
+                                    c.model
+                                },
+                                power_state: match c.state {
+                                    crate::plugin::ConsoleState::On => "On",
+                                    crate::plugin::ConsoleState::Standby => "ConnectedStandby",
+                                    crate::plugin::ConsoleState::Off => "Off",
+                                    crate::plugin::ConsoleState::Unknown => "Unknown",
+                                }
+                                .into(),
+                                out_of_home: false,
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("plugin {}: {e:#}", p.id);
+                        errors.push(format!("{} plugin: {e:#}", p.name));
+                    }
+                }
+            }
+            let mut b = bg.lock().unwrap();
+            b.plugin_consoles = list;
+            b.needs_pairing = needs_pairing;
+            b.plugins_loading = false;
+            for e in errors {
+                b.toasts.push((e, true));
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    /// The PIN window for a plugin console that isn't paired yet. Pairing runs in the
+    /// background; on success the console starts right away.
+    fn pairing_window(&mut self, ctx: &egui::Context) {
+        if self.pairing.is_none() {
+            return;
+        }
+        let finished = if self.pairing.as_ref().is_some_and(|p| p.busy) {
+            self.bg.lock().unwrap().pair_result.take()
+        } else {
+            None
+        };
+        match finished {
+            Some(Ok(())) => {
+                let p = self.pairing.take().unwrap();
+                self.bg.lock().unwrap().needs_pairing.remove(&p.console.server_id);
+                self.toast(format!("Paired with {}", p.console.name), false);
+                self.load_plugin_consoles();
+                let mode = self.settings.last_mode;
+                self.start_session(p.console, mode);
+                return;
+            }
+            Some(Err(e)) => {
+                if let Some(p) = self.pairing.as_mut() {
+                    p.busy = false;
+                    p.error = Some(e);
+                }
+            }
+            None => {}
+        }
+        let mut pair = false;
+        let mut cancel = false;
+        let p = self.pairing.as_mut().unwrap();
+        egui::Window::new("Pair a console")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_width(380.0);
+                ui.label(
+                    RichText::new(format!("Pair XMouse with {}", p.console.name))
+                        .font(bold(17.0))
+                        .color(INK),
+                );
+                hint(
+                    ui,
+                    "Enter the PIN the console shows for remote play pairing. This is needed once.",
+                );
+                ui.add_space(6.0);
+                let edit = ui.add_enabled(
+                    !p.busy,
+                    egui::TextEdit::singleline(&mut p.pin)
+                        .char_limit(16)
+                        .hint_text("PIN")
+                        .desired_width(200.0),
+                );
+                if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    pair = true;
+                }
+                if let Some(e) = &p.error {
+                    ui.label(RichText::new(e).font(body(14.0)).color(SIGNAL_TEXT));
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if p.busy {
+                        ui.spinner();
+                        ui.label(RichText::new("Pairing…").font(body(14.0)).color(MUTED));
+                    } else {
+                        if primary(ui, "Pair", 120.0).clicked() {
+                            pair = true;
+                        }
+                        if secondary(ui, "Cancel", 120.0).clicked() {
+                            cancel = true;
+                        }
+                    }
+                });
+            });
+        if cancel {
+            self.pairing = None;
+            return;
+        }
+        let p = self.pairing.as_mut().unwrap();
+        if pair && !p.busy && !p.pin.trim().is_empty() {
+            let Some((pid, cid)) = plugin_console_ref(&p.console.server_id) else {
+                self.pairing = None;
+                return;
+            };
+            let Some(info) = self.plugins.iter().find(|x| x.id == pid).cloned() else {
+                p.error = Some("The plugin for this console is no longer installed.".into());
+                return;
+            };
+            p.busy = true;
+            p.error = None;
+            let (cid, pin) = (cid.to_string(), p.pin.trim().to_string());
+            let (bg, ctx) = (self.bg.clone(), self.ctx.clone());
+            self.bg.lock().unwrap().pair_result = None;
+            self.rt.spawn_blocking(move || {
+                let res = crate::plugin::pair(&info, &cid, &pin, &Default::default())
+                    .map_err(|e| format!("{e:#}"));
+                bg.lock().unwrap().pair_result = Some(res);
+                ctx.request_repaint();
+            });
+        }
+    }
+
+    fn plugin(&self, id: &str) -> Option<crate::plugin::PluginInfo> {
+        self.plugins.iter().find(|p| p.id == id).cloned()
     }
 
     fn wake(&self, id: String, name: String) {
+        if let Some((pid, cid)) = plugin_console_ref(&id) {
+            let Some(info) = self.plugin(pid) else { return };
+            let (cid, bg, ctx) = (cid.to_string(), self.bg.clone(), self.ctx.clone());
+            self.rt.spawn_blocking(move || {
+                let msg = match crate::plugin::wake(&info, &cid) {
+                    Ok(()) => (format!("Wake-up sent to {name}"), false),
+                    Err(e) => (format!("Could not wake {name}: {e:#}"), true),
+                };
+                bg.lock().unwrap().toasts.push(msg);
+                ctx.request_repaint();
+            });
+            return;
+        }
         let (auth, bg, ctx) = (self.auth.clone(), self.bg.clone(), self.ctx.clone());
         self.rt.spawn(async move {
             let res = async {
@@ -317,6 +538,26 @@ impl XMouseApp {
     }
 
     fn start_session(&mut self, console: ConsoleInfo, mode: PlayMode) {
+        // A plugin console that isn't paired yet: ask for the PIN first.
+        if self.bg.lock().unwrap().needs_pairing.contains(&console.server_id) {
+            self.pairing = Some(Pairing {
+                console,
+                pin: String::new(),
+                busy: false,
+                error: None,
+            });
+            return;
+        }
+        let plugin = match plugin_console_ref(&console.server_id) {
+            Some((pid, cid)) => match self.plugin(pid) {
+                Some(info) => Some((info, cid.to_string())),
+                None => {
+                    self.toast(format!("The plugin for {} is no longer installed", console.name), true);
+                    return;
+                }
+            },
+            None => None,
+        };
         self.flush_profile();
         self.stop_test();
         let profile = self.profile().clone();
@@ -343,7 +584,22 @@ impl XMouseApp {
         };
         let ctx = self.ctx.clone();
         let repaint: crate::stream::Repaint = Arc::new(move || ctx.request_repaint());
-        if self.demo {
+        if let Some((info, console_id)) = plugin {
+            // Another platform: the plugin does the network side, everything else is shared.
+            let pcfg = crate::plugin::PluginSessionConfig {
+                mode,
+                bitrate_kbps: cfg.video_bitrate,
+                input_hz: cfg.input_hz,
+                ..Default::default()
+            };
+            self.rt.spawn(crate::plugin::run_plugin_session(
+                info,
+                console_id,
+                pcfg,
+                shared.clone(),
+                repaint,
+            ));
+        } else if self.demo {
             self.rt
                 .spawn(crate::stream::run_demo_session(shared.clone(), repaint));
         } else {
@@ -552,6 +808,7 @@ impl eframe::App for XMouseApp {
         for (m, e) in new_toasts {
             self.toast(m, e);
         }
+        self.pairing_window(&ctx);
 
         let signed_in = self.bg.lock().unwrap().signed_in;
         if self.session.is_some() {
@@ -837,7 +1094,7 @@ impl XMouseApp {
     fn home_page(&mut self, ui: &mut Ui) {
         let (consoles, loading) = {
             let b = self.bg.lock().unwrap();
-            (b.consoles.clone(), b.consoles_loading)
+            (all_consoles(&b), b.consoles_loading)
         };
         if consoles.is_none() && !loading {
             self.load_consoles();
@@ -869,14 +1126,20 @@ impl XMouseApp {
             }
         }
         // --play: one-click start (e.g. a desktop shortcut) on the last console, last mode.
+        // A plugin console may only show up once the plugins have answered: wait for them
+        // before giving up.
         if self.play_on_start && consoles.is_some() {
-            self.play_on_start = false;
-            if let Some(c) = list
+            let found = list
                 .iter()
                 .find(|c| c.server_id == self.settings.last_console)
-            {
+                .cloned();
+            let plugins_loading = self.bg.lock().unwrap().plugins_loading;
+            if found.is_some() || !plugins_loading {
+                self.play_on_start = false;
+            }
+            if let Some(c) = found {
                 let mode = self.settings.last_mode;
-                self.start_session(c.clone(), mode);
+                self.start_session(c, mode);
                 return;
             }
         }
@@ -1142,7 +1405,7 @@ impl XMouseApp {
     fn consoles_page(&mut self, ui: &mut Ui) {
         let (consoles, loading) = {
             let b = self.bg.lock().unwrap();
-            (b.consoles.clone(), b.consoles_loading)
+            (all_consoles(&b), b.consoles_loading)
         };
         if consoles.is_none() && !loading {
             self.load_consoles();
@@ -2978,7 +3241,12 @@ fn player_window(
 ) -> PlayerResult {
     let mut out = PlayerResult::default();
     let builder = egui::ViewportBuilder::default()
-        .with_title("XMouse – Xbox")
+        // Plugin consoles (other platforms) show their own name instead of "Xbox".
+        .with_title(if plugin_console_ref(&s.console.server_id).is_some() {
+            format!("XMouse – {}", s.console.name)
+        } else {
+            "XMouse – Xbox".to_string()
+        })
         .with_inner_size([1280.0, 720.0])
         .with_min_inner_size([480.0, 270.0]);
     ctx.show_viewport_immediate(player_id(), builder, |ui, _class| {
@@ -3338,7 +3606,11 @@ fn finder_overlay(ctx: &egui::Context, s: &Session) {
     }
 }
 
-fn short_console(c: &ConsoleInfo) -> &'static str {
+fn short_console(c: &ConsoleInfo) -> String {
+    if plugin_console_ref(&c.server_id).is_some() {
+        // A plugin's console: its own model name (e.g. "PS5").
+        return c.console_type.clone();
+    }
     match c.console_type.as_str() {
         "XboxSeriesX" => "Series X",
         "XboxSeriesS" => "Series S",
@@ -3346,6 +3618,7 @@ fn short_console(c: &ConsoleInfo) -> &'static str {
         "XboxOneS" => "One S",
         _ => "Xbox",
     }
+    .to_string()
 }
 
 fn short_game(g: &str) -> String {

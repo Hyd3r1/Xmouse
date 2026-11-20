@@ -43,6 +43,11 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Direct3D12",
     "Win32_Graphics_Direct3D_Fxc",
     "Win32_Security",
+    # Checking who signed a downloaded frame-generation library (src/framegen/install.rs).
+    "Win32_Security_Cryptography",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_Cryptography_Sip",
+    "Win32_Security_WinTrust",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",

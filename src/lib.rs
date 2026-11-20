@@ -15,6 +15,8 @@ pub mod pacing;
 pub mod testvideo;
 pub mod video;
 #[cfg(windows)]
+pub mod framegen;
+#[cfg(windows)]
 pub mod hwdecode;
 #[cfg(windows)]
 pub mod vsr;

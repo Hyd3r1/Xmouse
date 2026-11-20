@@ -44,6 +44,9 @@ pub struct Settings {
     pub pc_brightness: f32,
     /// Add in-between frames (frame generation).
     pub pc_smooth_motion: bool,
+    /// Frame generation by AMD FSR / NVIDIA DLSS (their files are installed on request).
+    pub pc_fsr_fg: bool,
+    pub pc_dlss_fg: bool,
     /// Enlarge the picture with XMouse's own edge-aware scaler when RTX Video isn't used.
     pub pc_sharp_upscale: bool,
     pub input_hz: u32,
@@ -76,6 +79,8 @@ impl Default for Settings {
             pc_contrast: 0.0,
             pc_brightness: 0.0,
             pc_smooth_motion: false,
+            pc_fsr_fg: false,
+            pc_dlss_fg: false,
             pc_sharp_upscale: false,
             input_hz: 120,
             show_hud: true,
@@ -118,6 +123,12 @@ impl Storage {
     /// at the next start, the graphics driver crashed during upscaling.
     pub fn vsr_guard_file(&self) -> PathBuf {
         self.dir.join("rtx-video-guard")
+    }
+
+    /// Present while frame generation is in its first moments of a session. If XMouse finds it
+    /// at the next start, the graphics driver crashed with it.
+    pub fn framegen_guard_file(&self) -> PathBuf {
+        self.dir.join("framegen-guard")
     }
 
     pub fn settings(&self) -> Settings {

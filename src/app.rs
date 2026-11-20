@@ -218,6 +218,8 @@ struct Session {
     vsr_target: [u32; 2],
     /// Size of the decoded stream.
     video_size: [u32; 2],
+    /// The picture's rectangle in the player window, in real pixels (x, y, width, height).
+    fg_rect: [i32; 4],
     mods: egui::Modifiers,
     /// When the picture first appeared (the "game ignoring your keys?" tip shows for a while).
     tip_since: Option<Instant>,
@@ -419,6 +421,17 @@ pub struct XMouseApp {
     pipe: Option<Pipeline>,
     /// They failed once on this graphics driver: show the plain picture for this run.
     pipe_failed: bool,
+    /// The frame-generation picture surface (FSR / DLSS), while a session uses one.
+    #[cfg(windows)]
+    fg: Option<crate::framegen::Surface>,
+    /// It failed in this session: stay on the normal picture until the next one.
+    fg_failed: bool,
+    /// Its guard file is on disk.
+    fg_guard_armed: bool,
+    /// The note about NVIDIA's files is showing, waiting for a yes.
+    fg_confirm_dlss: bool,
+    /// (pictures in, frames out) at the last log line.
+    fg_seen: [u64; 2],
 }
 
 pub struct Options {
@@ -444,6 +457,22 @@ impl XMouseApp {
         // The graphics driver crashed while RTX Video was upscaling last time: switch it off
         // instead of crashing again on the next fullscreen.
         let mut startup_toasts = vec![];
+        // The same for frame generation: its guard file is still there when XMouse or the
+        // graphics driver went down in a session's first moments with it.
+        if storage.framegen_guard_file().exists() {
+            let _ = std::fs::remove_file(storage.framegen_guard_file());
+            if settings.pc_fsr_fg || settings.pc_dlss_fg {
+                settings.pc_fsr_fg = false;
+                settings.pc_dlss_fg = false;
+                storage.save_settings(&settings);
+                log::warn!("frame generation turned off: the last run crashed with it");
+                startup_toasts.push((
+                    "Frame generation was switched off because XMouse or the graphics driver crashed with it last time. You can turn it back on under Picture and connection.".to_string(),
+                    true,
+                    Instant::now(),
+                ));
+            }
+        }
         if storage.vsr_guard_file().exists() {
             let _ = std::fs::remove_file(storage.vsr_guard_file());
             if settings.pc_rtx_vsr {
@@ -515,6 +544,12 @@ impl XMouseApp {
             vsr_guard_target: [0, 0],
             pipe: None,
             pipe_failed: false,
+            #[cfg(windows)]
+            fg: None,
+            fg_failed: false,
+            fg_guard_armed: false,
+            fg_confirm_dlss: false,
+            fg_seen: [0; 2],
         };
         app.apply_platform_names();
         app
@@ -1014,6 +1049,7 @@ impl XMouseApp {
             show_hud: self.settings.show_hud,
             texture: None,
             vsr_tex: None,
+            fg_rect: [0; 4],
             vsr_target: [0, 0],
             video_size: [0, 0],
             tip_since: None,
@@ -1028,6 +1064,15 @@ impl XMouseApp {
     }
 
     fn end_session(&mut self, ctx: &egui::Context) {
+        #[cfg(windows)]
+        {
+            self.fg = None;
+        }
+        self.fg_failed = false;
+        if self.fg_guard_armed {
+            let _ = std::fs::remove_file(self.storage.framegen_guard_file());
+            self.fg_guard_armed = false;
+        }
         // A session that ended normally didn't crash the driver.
         if self.vsr_guard_armed {
             let _ = std::fs::remove_file(self.storage.vsr_guard_file());
@@ -3466,6 +3511,18 @@ impl XMouseApp {
     fn picture_page(&mut self, ui: &mut Ui) {
         title(ui, "Picture and connection", "Only if needed.");
         let mut changed = false;
+        // Frame generation: which files are installed, and what the user asked for below.
+        #[cfg(windows)]
+        let fg_have = {
+            use crate::framegen::{dll_dir, Kind};
+            [
+                dll_dir(Kind::Fsr, &self.storage.dir).is_some(),
+                dll_dir(Kind::Dlss, &self.storage.dir).is_some(),
+            ]
+        };
+        #[cfg(windows)]
+        let mut fg_install: Option<crate::framegen::Kind> = None;
+        let fg_confirm_dlss = &mut self.fg_confirm_dlss;
         let s = &mut self.settings;
         let Settings {
             tv_bitrate,
@@ -3483,6 +3540,8 @@ impl XMouseApp {
             pc_contrast,
             pc_brightness,
             pc_smooth_motion,
+            pc_fsr_fg,
+            pc_dlss_fg,
             pc_sharp_upscale,
             input_hz,
             show_hud,
@@ -3610,6 +3669,78 @@ impl XMouseApp {
                             changed |= switch(ui, pc_smooth_motion).changed();
                         },
                     );
+                    #[cfg(windows)]
+                    {
+                        use crate::framegen::install::{self, State};
+                        use crate::framegen::Kind;
+                        let before = (*pc_fsr_fg, *pc_dlss_fg);
+                        let nvidia = crate::framegen::nvidia_present();
+                        let rows: [(Kind, &mut bool, bool, &str, &str, &str); 2] = [
+                            (
+                                Kind::Fsr,
+                                &mut *pc_fsr_fg,
+                                fg_have[0],
+                                "Frame generation (FSR)",
+                                "AMD FSR adds one in-between frame per game frame (2X: 30 fps looks like 60) on any modern graphics card. Adds about half a game frame of input lag; a 60 fps game needs a 120 Hz screen. Runs while you play; the key overlay is hidden meanwhile.",
+                                "Needs AMD's files once (30 MB, from AMD's GitHub page).",
+                            ),
+                            (
+                                Kind::Dlss,
+                                &mut *pc_dlss_fg,
+                                fg_have[1],
+                                "Frame generation (DLSS)",
+                                "NVIDIA DLSS adds one in-between frame per game frame (2X). Needs a GeForce RTX 40 or 50 and the player window in front. Adds about half a game frame of input lag; a 60 fps game needs a 120 Hz screen. Runs while you play; the key overlay is hidden meanwhile.",
+                                "Needs NVIDIA's files once (a 280 MB download from NVIDIA's GitHub page).",
+                            ),
+                        ];
+                        for (kind, on, have, name, about, needs) in rows {
+                            let state = install::state(kind);
+                            let unsupported = kind == Kind::Dlss && !nvidia;
+                            let confirming = kind == Kind::Dlss && *fg_confirm_dlss && !have;
+                            let sub = match &state {
+                                State::Working(what) => what.clone(),
+                                _ if unsupported => {
+                                    "Needs an NVIDIA GeForce RTX 40 or 50 graphics card.".to_string()
+                                }
+                                _ if confirming => "These files are NVIDIA's own, under NVIDIA's licence (NVIDIA RTX SDKs License), and are downloaded from NVIDIA's GitHub page. They are not part of XMouse. Download them now?".to_string(),
+                                State::Failed(why) if !have => {
+                                    format!("{about} The download didn't work: {why}.")
+                                }
+                                _ if !have => format!("{about} {needs}"),
+                                _ => about.to_string(),
+                            };
+                            control_row(ui, false, name, &sub, |ui| {
+                                if unsupported {
+                                    *on = false;
+                                } else if matches!(state, State::Working(_)) {
+                                    ui.spinner();
+                                } else if have {
+                                    changed |= switch(ui, on).changed();
+                                } else if confirming {
+                                    if secondary(ui, "Cancel", 84.0).clicked() {
+                                        *fg_confirm_dlss = false;
+                                    }
+                                    if primary(ui, "Download", 104.0).clicked() {
+                                        *fg_confirm_dlss = false;
+                                        fg_install = Some(kind);
+                                    }
+                                } else if secondary(ui, "Install", 96.0).clicked() {
+                                    if kind == Kind::Dlss {
+                                        *fg_confirm_dlss = true;
+                                    } else {
+                                        fg_install = Some(kind);
+                                    }
+                                }
+                            });
+                        }
+                        // One at a time: the one switched on last stays on.
+                        if *pc_fsr_fg && !before.0 {
+                            *pc_dlss_fg = false;
+                        }
+                        if *pc_dlss_fg && !before.1 {
+                            *pc_fsr_fg = false;
+                        }
+                    }
                     control_row(
                         ui,
                         false,
@@ -3623,6 +3754,11 @@ impl XMouseApp {
                 hint(
                     ui,
                     "Clean up compression and Smooth motion use XMouse's own upscaling in place of RTX Video. Sharpen and Colour work with both.",
+                );
+                #[cfg(windows)]
+                hint(
+                    ui,
+                    "Frame generation shows the game at the stream's own resolution and takes the place of Smooth motion. FSR is AMD FidelityFX technology by Advanced Micro Devices, Inc.; DLSS is technology by NVIDIA Corporation. Their files are downloaded from the makers' own pages under the makers' licences.",
                 );
             } else {
                 section(ui, "PC Play");
@@ -3753,6 +3889,15 @@ impl XMouseApp {
                 });
             }
         });
+        #[cfg(windows)]
+        if let Some(kind) = fg_install {
+            let ctx = self.ctx.clone();
+            crate::framegen::install::start(kind, self.storage.dir.clone(), &self.rt, move || {
+                ctx.request_repaint()
+            });
+        }
+        #[cfg(not(windows))]
+        let _ = (fg_confirm_dlss, pc_fsr_fg, pc_dlss_fg);
         if changed {
             // Turning RTX Video upscaling (back) on gives it a fresh try next session.
             if self.settings.pc_rtx_vsr {
@@ -3801,6 +3946,13 @@ impl XMouseApp {
         // upscales NV12 frames on the GPU, or egui scales RGBA frames), RTX Video followed by
         // our own sharpening / colour passes, or everything in our own passes.
         let pc = s.mode == PlayMode::Pc;
+        // Frame generation by FSR or DLSS takes the place of our own in-between frames.
+        #[cfg(windows)]
+        let fg_wanted = fg_choice(&self.settings, &self.storage.dir).filter(|_| pc && !self.fg_failed);
+        #[cfg(not(windows))]
+        let fg_wanted: Option<()> = None;
+        let smooth_motion = smooth_motion && fg_wanted.is_none();
+        let mut fg_error: Option<String> = None;
         let gl = frame.gl().cloned();
         let post = look.sharpen.is_some() || look.colour.is_some();
         // Clean-up and in-between frames work on the stream's own pixels, before any scaling:
@@ -3811,7 +3963,7 @@ impl XMouseApp {
         if pc
             && self.pipe.is_none()
             && !self.pipe_failed
-            && (before_scaling || post || look.edge_upscale)
+            && (before_scaling || post || look.edge_upscale || fg_wanted.is_some())
         {
             if let Some(gl) = gl.as_ref() {
                 match Pipeline::new(gl) {
@@ -3853,6 +4005,14 @@ impl XMouseApp {
         } else {
             Route::Plain
         };
+        // The frame-generation surface takes the decoder's NV12 pictures; without RTX Video
+        // our own passes then draw the picture underneath it.
+        let route = if fg_wanted.is_some() && !gpu && pipe_ok {
+            Route::Pipeline
+        } else {
+            route
+        };
+        let fg_kind = fg_wanted.filter(|_| gpu || route == Route::Pipeline);
         s.shared.want_nv12.store(
             gpu || route == Route::Pipeline,
             std::sync::atomic::Ordering::Relaxed,
@@ -3901,7 +4061,20 @@ impl XMouseApp {
             let at = secs(f.at);
             s.pic.cadence.on_frame(at, kind != Kind::Duplicate);
             s.pic.stats.on_frame(at, kind);
-            if kind != Kind::Duplicate {
+            // The frame generators get every new picture, and never a repeat.
+            #[cfg(windows)]
+            if let (Some(surface), VideoFrame::Nv12 { width, height, data }, true) =
+                (self.fg.as_ref(), &f.frame, kind != Kind::Duplicate)
+            {
+                surface.push(crate::framegen::Frame {
+                    width: *width,
+                    height: *height,
+                    nv12: data.clone(),
+                    at: f.at,
+                    cut: matches!(kind, Kind::First | Kind::Cut),
+                    interval: s.pic.cadence.content_interval().unwrap_or(1.0 / 60.0),
+                });
+            }            if kind != Kind::Duplicate {
                 new_pictures.push((at, kind));
             }
         }
@@ -3913,6 +4086,68 @@ impl XMouseApp {
             };
         }
 
+        // The frame-generation surface: started once the stream's size is known, shown over
+        // the picture while you play (mouse captured), gone again on any failure.
+        #[cfg(windows)]
+        {
+            let size = s.video_size;
+            if self
+                .fg
+                .as_ref()
+                .is_some_and(|f| Some(f.kind) != fg_kind || (size[0] > 0 && f.size != size))
+            {
+                self.fg = None;
+            }
+            let usable = size[0] >= 64 && size[1] >= 64 && size[0] % 2 == 0 && size[1] % 2 == 0;
+            if let (Some(kind), true, true) = (fg_kind, self.fg.is_none(), usable) {
+                let started = crate::framegen::dll_dir(kind, &self.storage.dir)
+                    .zip(crate::framegen::find_own_window("XMouse \u{2013} "))
+                    .map(|(dir, hwnd)| {
+                        crate::framegen::Surface::start(kind, dir, hwnd, size[0], size[1])
+                    });
+                match started {
+                    Some(Ok(f)) => {
+                        // Crash guard: on disk until a few hundred frames went through.
+                        let _ = std::fs::write(
+                            self.storage.framegen_guard_file(),
+                            b"frame generation",
+                        );
+                        self.fg_guard_armed = true;
+                        self.fg_seen = [0; 2];
+                        self.fg = Some(f);
+                    }
+                    Some(Err(e)) => fg_error = Some(format!("{e:#}")),
+                    None => {}
+                }
+            }
+            if let Some(f) = self.fg.as_mut() {
+                if let Some(e) = f.error() {
+                    fg_error = Some(e);
+                } else {
+                    // XMOUSE_FG_ALWAYS shows it without a captured mouse, for testing.
+                    let playing = s.captured || std::env::var_os("XMOUSE_FG_ALWAYS").is_some();
+                    let show = playing && connected && f.ready() && s.fg_rect[2] > 16;
+                    f.place(s.fg_rect, show);
+                    let real = f.shared.real.load(std::sync::atomic::Ordering::Relaxed);
+                    if self.fg_guard_armed && real > 300 {
+                        let _ = std::fs::remove_file(self.storage.framegen_guard_file());
+                        self.fg_guard_armed = false;
+                    }
+                    // New pictures are handed over from this loop: look often.
+                    ctx.request_repaint_after(Duration::from_millis(4));
+                }
+            }
+            if fg_error.is_some() {
+                self.fg = None;
+                self.fg_failed = true;
+                if self.fg_guard_armed {
+                    let _ = std::fs::remove_file(self.storage.framegen_guard_file());
+                    self.fg_guard_armed = false;
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = fg_kind;
         if route == Route::Pipeline {
             if let (Some(p), Some(gl)) = (self.pipe.as_mut(), gl.as_ref()) {
                 let hz = match s.pic.display {
@@ -4138,6 +4373,19 @@ impl XMouseApp {
                     line += &format!(", display {hz:.0} Hz");
                 }
                 s.pic.late = 0.0;
+            }
+            #[cfg(windows)]
+            if let Some(f) = &self.fg {
+                let o = std::sync::atomic::Ordering::Relaxed;
+                let now_seen = [f.shared.real.load(o), f.shared.shown.load(o)];
+                line += &format!(
+                    " | {} frame generation: {} pictures in, {} frames out since the last line, longest gap between pictures {:.1} ms",
+                    f.kind.name(),
+                    now_seen[0].saturating_sub(self.fg_seen[0]),
+                    now_seen[1].saturating_sub(self.fg_seen[1]),
+                    f.shared.worst_gap.swap(0, o) as f64 / 10.0
+                );
+                self.fg_seen = now_seen;
             }
             if route != Route::Plain {
                 if let Some(p) = &self.pipe {
@@ -4378,6 +4626,13 @@ impl XMouseApp {
                 Err(e) => self.toast(format!("Could not save: {e}"), true),
             }
         }
+        if let Some(e) = fg_error {
+            log::warn!("frame generation off for this session: {e}");
+            self.toast(
+                format!("Frame generation can't run: {e}. Showing the normal picture."),
+                true,
+            );
+        }
         if pipe_error.is_some() {
             self.toast(
                 "The picture settings can't run on this graphics card. Showing the plain picture.",
@@ -4428,6 +4683,20 @@ fn forced_picture_size() -> Option<[u32; 2]> {
         let (w, h) = v.split_once('x')?;
         Some([w.parse().ok()?, h.parse().ok()?])
     })
+}
+
+/// Which frame generator a session should use: one that is switched on and whose files are
+/// installed, DLSS before FSR.
+#[cfg(windows)]
+fn fg_choice(s: &Settings, config_dir: &std::path::Path) -> Option<crate::framegen::Kind> {
+    use crate::framegen::{dll_dir, Kind};
+    if s.pc_dlss_fg && crate::framegen::nvidia_present() && dll_dir(Kind::Dlss, config_dir).is_some() {
+        Some(Kind::Dlss)
+    } else if s.pc_fsr_fg && dll_dir(Kind::Fsr, config_dir).is_some() {
+        Some(Kind::Fsr)
+    } else {
+        None
+    }
 }
 
 fn player_id() -> egui::ViewportId {
@@ -4491,6 +4760,12 @@ fn player_window(
                 let pic = egui::Rect::from_center_size(rect.center(), fit);
                 picture = pic;
                 let ppp = ui.ctx().pixels_per_point();
+                s.fg_rect = [
+                    (pic.min.x * ppp).round() as i32,
+                    (pic.min.y * ppp).round() as i32,
+                    (pic.width() * ppp).round() as i32,
+                    (pic.height() * ppp).round() as i32,
+                ];
                 s.vsr_target = forced_picture_size().unwrap_or([
                     (fit.x * ppp).round().max(16.0) as u32,
                     (fit.y * ppp).round().max(16.0) as u32,

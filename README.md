@@ -16,6 +16,8 @@ One small Windows app. Pick your console, press Play, and its picture and sound 
 - **Your console, on your PC.** The game streams over your home network in up to 1080p at 60 fps, with sound, in its own window. Go fullscreen with F11.
 - **Mouse and keyboard as a controller.** Every key and mouse button can be any controller button, stick direction or trigger. Mouse movement becomes a smooth, tunable right stick.
 - **Speaks your controller's language.** On PlayStation the app shows a DualSense and PlayStation button names (Cross, Circle, L1, R2, Options); on Xbox it shows an Xbox controller and A, B, LB, RT.
+- **Frame generation.** Turn on AMD FSR or NVIDIA DLSS frame generation and a 30 fps game plays at 60 (or 60 at 120). XMouse downloads the maker's files for you with one click.
+- **A cleaner picture.** Optional clean-up for compression blocks and banding, sharpening, vibrance and contrast, all behind their own switches.
 - **Sharper picture on NVIDIA RTX.** RTX Video Super Resolution upscales the stream to your monitor, so 1080p looks crisp on a 1440p or 4K screen.
 - **GPU video decoding.** Turn it on and your graphics card decodes the stream in under 2 ms a frame instead of the CPU, for less input lag. It falls back to the CPU by itself if it can't run.
 - **Ready-made game profiles.** GTA VI, GTA V, Red Dead Redemption 2, a standard shooter layout, third-person action games and the console menus. Each one is fully editable and works on both consoles.
@@ -125,6 +127,7 @@ Button names are Xbox / PlayStation.
 - **One-click play:** start XMouse with `--play` (for example from a desktop shortcut) and it connects straight to your last console in your last mode.
 - **No sharper picture on RTX?** Turn on *Super Resolution* under *Graphics → Video* in the NVIDIA app, and check that *RTX Video upscaling* is *On* under *More → Picture and connection* in XMouse.
 - **Picture stutters?** Plug the PC or the console into the router with a cable, and close other heavy downloads on the network.
+- **Smoother motion:** under *More → Picture and connection → PC Play picture*, install and turn on *Frame generation (FSR)* (any modern graphics card) or *Frame generation (DLSS)* (GeForce RTX 40 or 50, with the player window in front). It adds about half a game frame of input lag, and a 60 fps game needs a 120 Hz screen. The key overlay is hidden while it runs.
 
 ## Plugins
 
@@ -157,4 +160,4 @@ XMouse is licensed under [CC BY-NC-SA 4.0](LICENSE) (Creative Commons Attributio
 
 ## Not affiliated
 
-XMouse is an independent project for playing your own console at home. It isn't made, endorsed or supported by Microsoft, Sony Interactive Entertainment or any game publisher. Xbox is a trademark of Microsoft. PlayStation, PS5, PS4 and DualSense are trademarks of Sony Interactive Entertainment. Game names and screenshots belong to their owners.
+XMouse is an independent project for playing your own console at home. It isn't made, endorsed or supported by Microsoft, Sony Interactive Entertainment, NVIDIA, AMD or any game publisher. AMD FSR frame generation and NVIDIA DLSS frame generation are not part of XMouse: their files are downloaded from AMD's and NVIDIA's own GitHub pages, only when you ask, under their makers' licences. AMD, FidelityFX and FSR are trademarks of Advanced Micro Devices, Inc. NVIDIA, GeForce RTX and DLSS are trademarks of NVIDIA Corporation. Xbox is a trademark of Microsoft. PlayStation, PS5, PS4 and DualSense are trademarks of Sony Interactive Entertainment. Game names and screenshots belong to their owners.

@@ -24,6 +24,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # audiopus_sys builds the bundled libopus with a CMakeLists.txt that asks for CMake < 3.5,
+  # which CMake 4 (on the runners) refuses without this.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 jobs:
   windows:

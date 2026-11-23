@@ -233,6 +233,13 @@ pub struct StreamConfig {
     pub input_hz: u32,
     pub ice_servers: Vec<String>,
     pub connect_timeout: Duration,
+    /// The console's name in the xHome list (to recognise it in LAN discovery).
+    pub console_name: String,
+    /// The console's LAN IPv4 address typed in by the user; empty = find it automatically.
+    pub console_ip: String,
+    /// The console's LAN address, once known: offered as an extra ICE candidate so the
+    /// connection can go straight across the home network.
+    pub lan_ip: Option<std::net::Ipv4Addr>,
 }
 
 impl Default for StreamConfig {
@@ -247,6 +254,9 @@ impl Default for StreamConfig {
                 "stun:stun1.l.google.com:19302".into(),
             ],
             connect_timeout: Duration::from_secs(45),
+            console_name: String::new(),
+            console_ip: String::new(),
+            lan_ip: None,
         }
     }
 }
@@ -301,10 +311,22 @@ pub async fn run_session(
 async fn run_session_inner(
     auth: &Arc<Auth>,
     console_id: &str,
-    cfg: StreamConfig,
+    mut cfg: StreamConfig,
     shared: &Arc<Shared>,
     repaint: &Repaint,
 ) -> Result<()> {
+    // Look for the console on the home network while the service wakes it up.
+    let manual_ip = cfg.console_ip.trim().parse::<std::net::Ipv4Addr>().ok();
+    if !cfg.console_ip.trim().is_empty() && manual_ip.is_none() {
+        log::warn!("ignoring console IP setting {:?}: not an IPv4 address", cfg.console_ip);
+    }
+    let discovery = if manual_ip.is_none() {
+        Some(tokio::task::spawn_blocking(|| {
+            crate::xbox_lan::discover(Duration::from_secs(3))
+        }))
+    } else {
+        None
+    };
     shared.set(
         Phase::Starting,
         "Asking Xbox to start a remote play session…",
@@ -346,6 +368,26 @@ async fn run_session_inner(
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+
+    cfg.lan_ip = match (manual_ip, discovery) {
+        (Some(ip), _) => {
+            log::info!("console LAN address from settings: {ip}");
+            Some(ip)
+        }
+        (None, Some(task)) => {
+            let found = task.await.unwrap_or_default();
+            let ip = crate::xbox_lan::pick(&found, &cfg.console_name);
+            match ip {
+                Some(ip) => log::info!("console LAN address found: {ip}"),
+                None => log::info!(
+                    "console not found on the LAN ({} answered); relying on the service's candidates",
+                    found.len()
+                ),
+            }
+            ip
+        }
+        (None, None) => None,
+    };
 
     shared.set(Phase::Connecting, "Connecting over your home network…");
     repaint();
@@ -861,10 +903,22 @@ async fn run_connection<S: Signaling>(
         );
     }
 
-    let remote = sig
+    let mut remote = sig
         .exchange_ice(candidates)
         .await
         .context("ICE exchange failed")?;
+    if let Some(ip) = cfg.lan_ip {
+        let c = crate::xbox_lan::lan_candidate(ip);
+        log::info!("adding direct LAN candidate: {}", c.trim());
+        remote.insert(
+            0,
+            IceCandidate {
+                candidate: c,
+                sdp_mid: Some(json!("0")),
+                sdp_mline_index: Some(json!("0")),
+            },
+        );
+    }
     for c in &remote {
         if let Some(init) = remote_candidate(c) {
             if let Err(e) = pc.add_ice_candidate(init).await {

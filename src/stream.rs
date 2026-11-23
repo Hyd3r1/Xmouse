@@ -16,6 +16,9 @@ use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264, MIME_TYPE_OPUS};
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::data_channel::RTCDataChannel;
+use webrtc::ice::network_type::NetworkType;
+use webrtc::ice::udp_mux::{UDPMux, UDPMuxDefault, UDPMuxParams};
+use webrtc::ice::udp_network::UDPNetwork;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
@@ -672,6 +675,12 @@ pub async fn connect<S: Signaling>(
     // small audio packets did. Read with a buffer big enough for any UDP packet on the LAN.
     let mut settings = webrtc::api::setting_engine::SettingEngine::default();
     settings.set_receive_mtu(8192);
+    // One UDP socket of our own for all ICE traffic (see `ice_socket`), IPv4 only.
+    let mux = UDPMuxDefault::new(UDPMuxParams::new(tokio::net::UdpSocket::from_std(
+        ice_socket()?,
+    )?));
+    settings.set_udp_network(UDPNetwork::Muxed(mux.clone()));
+    settings.set_network_types(vec![NetworkType::Udp4]);
     let api = APIBuilder::new()
         .with_media_engine(m)
         .with_interceptor_registry(registry)
@@ -693,7 +702,56 @@ pub async fn connect<S: Signaling>(
     );
     let result = run_connection(&pc, sig, &cfg, &shared, &repaint).await;
     let _ = pc.close().await;
+    let _ = mux.close().await;
     result
+}
+
+/// The UDP socket ICE runs on.
+///
+/// webrtc-rs normally opens one socket per network interface and stops reading a socket at
+/// its first receive error. On Windows a datagram answered with ICMP "port unreachable" makes
+/// the *next* receive on that socket fail with WSAECONNRESET, so a single connectivity check
+/// to a dead address (e.g. the Teredo-derived `<public ip>:3074` candidate) silently killed
+/// the socket: the console's answers and checks were never read again and the connection
+/// failed after 30 s although the LAN path had already worked. Here the socket is ours, with
+/// that behaviour switched off.
+fn ice_socket() -> std::io::Result<std::net::UdpSocket> {
+    let socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))?;
+    socket.set_nonblocking(true)?;
+    #[cfg(windows)]
+    disable_udp_connreset(&socket);
+    log::info!("ICE socket: {}", socket.local_addr()?);
+    Ok(socket)
+}
+
+#[cfg(windows)]
+fn disable_udp_connreset(socket: &std::net::UdpSocket) {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{WSAIoctl, SOCKET};
+    // _WSAIOW(IOC_VENDOR, 12)
+    const SIO_UDP_CONNRESET: u32 = 0x9800_000C;
+    let off: u32 = 0;
+    let mut returned: u32 = 0;
+    // SAFETY: a valid socket handle, a 4-byte input buffer, no output buffer, no overlapped I/O.
+    let rc = unsafe {
+        WSAIoctl(
+            socket.as_raw_socket() as SOCKET,
+            SIO_UDP_CONNRESET,
+            &off as *const u32 as *const core::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+            None,
+        )
+    };
+    if rc != 0 {
+        log::warn!(
+            "could not turn off UDP connection resets on the ICE socket: {}",
+            std::io::Error::last_os_error()
+        );
+    }
 }
 
 async fn run_connection<S: Signaling>(

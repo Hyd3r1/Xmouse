@@ -768,6 +768,10 @@ async fn run_connection<S: Signaling>(
         }
     }
 
+    pc.on_ice_connection_state_change(Box::new(|s| {
+        log::info!("ICE connection: {s}");
+        Box::pin(async {})
+    }));
     {
         let failed = failed.clone();
         pc.on_peer_connection_state_change(Box::new(move |s| {
@@ -831,6 +835,9 @@ async fn run_connection<S: Signaling>(
         .unwrap_or_default();
     let candidates = local_candidates(&local_sdp);
     log::info!("local ICE candidates: {}", candidates.len());
+    for c in &candidates {
+        log::info!("  local candidate: {}", c.candidate);
+    }
 
     let answer = sig
         .exchange_sdp(limit_resolution(
